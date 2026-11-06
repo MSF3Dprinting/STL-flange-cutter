@@ -1,0 +1,5 @@
+# Tests and Windows packaging. Install with: pip install -r requirements.txt -r requirements-dev.txt
+pytest==9.2.0
+playwright==1.64.1                 # UI smoke test; then run: python -m playwright install chromium
+pyinstaller==6.22.3                # one-folder Windows build
+pyinstaller-hooks-contrib==2026.9

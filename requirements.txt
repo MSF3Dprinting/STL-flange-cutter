@@ -1,0 +1,16 @@
+# Runtime dependencies of Flange Cutter, all versions pinned (Python 3.12).
+# Direct dependencies
+flask==3.1.3          # local web server and JSON API
+manifold3d==3.5.4     # booleans, plane split, slice, extrude
+shapely==2.2.0        # one-sided 2D offsets, arc length, nearest-segment lookup
+trimesh==5.2.0        # STL input/output, repair, mesh-plane intersection with face indices
+numpy==2.5.4
+networkx==3.7         # needed by trimesh to repair the face winding of broken STLs
+# Pulled in by Flask
+werkzeug==3.1.9
+jinja2==3.1.6
+markupsafe==3.0.4
+itsdangerous==2.2.0
+click==8.5.0
+blinker==1.9.0
+colorama==0.4.6; platform_system == "Windows"

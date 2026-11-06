@@ -1,0 +1,16 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Build output
+build/out/
+dist/
+*.spec.bak
+
+# Local and scratch
+flange-cutter-starter.zip
+out/
+.DS_Store
+Thumbs.db
