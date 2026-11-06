@@ -7,9 +7,12 @@ import os
 import secrets
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .geometry import CutError
-from .geometry.mesh_io import Model
+
+if TYPE_CHECKING:          # keeps this module light: the launcher imports app_dir() before numpy & co.
+    from .geometry.mesh_io import Model
 
 KEEP_RESULTS = 3
 MAX_PREFS_BYTES = 64 * 1024

@@ -15,11 +15,8 @@ import threading
 import urllib.request
 import webbrowser
 
-from werkzeug.serving import make_server
-
 from . import APP_NAME, __version__
-from .server import create_app
-from .session import app_dir
+from .session import app_dir      # light: the geometry libraries load only after the single-instance check
 
 LOCK_NAME = "flangecutter.lock"
 log = logging.getLogger("flangecutter")
@@ -69,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
             webbrowser.open(url)
         return 0
 
+    from werkzeug.serving import make_server
+    from .server import create_app            # numpy, trimesh, manifold3d: only now (a second start is quick)
     app = create_app()
     server = make_server("127.0.0.1", args.port, app, threaded=True)
     url = f"http://127.0.0.1:{server.server_port}/"
