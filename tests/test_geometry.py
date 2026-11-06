@@ -1,10 +1,13 @@
 """Geometry tests: the proof-of-concept checks, every option, several cuts, bad inputs, speed."""
+import json
 import math
 import time
 
 import numpy as np
 import pytest
+import shapely
 import trimesh
+from manifold3d import Manifold, OpType
 from shapely.geometry import Point, Polygon
 
 from conftest import reload_stl
@@ -166,6 +169,17 @@ def test_hardware_and_report(model):
 
 
 # ---------------------------------------------------------------- several cuts
+def hardware_overlap(res) -> float:
+    """Volume shared by the bolts (with washers, nuts and bolt ends) of different cuts."""
+    per_cut = []
+    for c, s, lay in zip(res.cuts, res.secs, res.lays):
+        reach = c.d.thickness + c.d.protrusion
+        rod = Manifold.cylinder(2 * reach, c.d.bolt.washer / 2, -1, 24, True)
+        per_cut.append(Manifold.batch_boolean([rod.translate((x, y, 0.0)) for x, y in lay.pts], OpType.Add)
+                       .transform(s.plane.to_world()))
+    return sum((a ^ b).volume() for i, a in enumerate(per_cut) for b in per_cut[i + 1:])
+
+
 def test_cross_cut_gives_four_watertight_parts(model, cavity):
     lengthwise_mid = dict(LENGTHWISE, plane={"origin": [0, 0, 120], "normal": [0, 1, 0], "x_axis": [1, 0, 0]})
     cs = cuts(lengthwise_mid, ACROSS_Z)
@@ -173,9 +187,11 @@ def test_cross_cut_gives_four_watertight_parts(model, cavity):
     assert [p.signature for p in res.parts] == ["AA", "AB", "BA", "BB"]
     assert all(p.touches == [0, 1] for p in res.parts)
     check_parts(res, model, cavity, cs)
-    for lay in res.lays:                       # no bolt inside a crossing band
-        for band in lay.bands:
-            assert np.all(np.abs(lay.pts @ band.a - band.c) >= band.half - 1e-6)
+    assert hardware_overlap(res) < 0.01            # bolts of the two cuts never run into each other
+    assert [[j[:2] for j in joins] for joins in res.joins] == [[("A", "C"), ("B", "D")], [("A", "B"), ("C", "D")]]
+    assert all(p.down == (1, p.signature[1]) for p in res.parts)   # quarters lie on the transverse face
+    codes = {w["code"] for w in res.warnings}
+    assert not codes & {"joint_unbolted", "joint_one_bolt", "part_unbolted", "flange_overhang", "not_watertight"}
 
 
 def test_three_crossing_cuts(model, cavity):
@@ -183,6 +199,45 @@ def test_three_crossing_cuts(model, cavity):
     res = cutter.generate(model, cs)
     assert len(res.parts) == 8
     check_parts(res, model, cavity, cs)
+    assert hardware_overlap(res) < 0.01
+
+
+def test_three_slices_with_parallel_cuts(model, cavity):
+    """The common 'too long for the printer' job: two parallel cuts give three parts."""
+    low = dict(ACROSS_Z, plane={"origin": [0, 0, 80], "normal": [0, 0, 1]})
+    high = dict(ACROSS_Z, plane={"origin": [0, 0, 160], "normal": [0, 0, 1]})
+    cs = cuts(low, high)
+    res = cutter.generate(model, cs)
+    assert [p.signature for p in res.parts] == ["AA", "AB", "BB"]    # above both, between, below both
+    check_parts(res, model, cavity, cs)
+    summary = cutter.summary(res)
+    json.loads(json.dumps(summary), parse_constant=lambda c: pytest.fail(f"{c} in JSON"))
+    middle = res.parts[1]
+    assert sorted(middle.touches) == [0, 1] and np.allclose(middle.explode, middle.explode)   # finite
+    assert any(w["code"] == "flange_overhang" and "Part B" in w["message"] for w in res.warnings)
+
+
+@pytest.mark.parametrize("normal, offset", [((1, 0, 0), 3.0), ((1, 0, 0), 7.5), ((1, 0, 0), 12.0),
+                                            ((0, 1, 0), 6.0), ((0, 1, 0), -6.0)])
+def test_float32_export_regressions(model, normal, offset):
+    """Cut positions where outline vertices on the rim used to leave sub-micron edges."""
+    raw = {"plane": {"origin": list(np.array(normal) * offset), "normal": list(normal)}, "count": 8}
+    res = cutter.generate(model, cuts(raw))
+    for p in res.parts:
+        tm = reload_stl(p.stl())
+        assert tm.is_watertight and tm.nondegenerate_faces().all(), f"part {p.name}"
+
+
+def test_two_wall_loops_keep_both_cavities_clean():
+    """One cut through two separate cups: each loop has its own cavity, so no flange goes inside."""
+    cup = Manifold.cylinder(200, 25, -1, 96) - Manifold.cylinder(200, 22.5, -1, 96).translate((0, 0, 2.5))
+    pair = cup.translate((-45, 0, 0)) + cup.translate((45, 0, 0)) + Manifold.cube((90, 10, 2.5)).translate((-45, -5, 0))
+    model = mesh_io.load_stl(mesh_io.stl_bytes(pair), "two_cups.stl")
+    pv = cutter.preview(model, cuts({"plane": {"origin": [0, 0, 60], "normal": [0, 0, 1]}, "count": 12}))
+    flange = shapely.union_all([Polygon(p["exterior"], p["holes"]) for p in pv["cuts"][0]["flange"]])
+    cavities = shapely.union_all([Polygon(h) for p in pv["cuts"][0]["section"] for h in p["holes"]])
+    assert len(pv["cuts"][0]["cavities"]) == 2
+    assert flange.intersection(cavities).area < 1e-3
 
 
 def test_preview_and_generate_place_the_same_bolts(model):
@@ -191,7 +246,7 @@ def test_preview_and_generate_place_the_same_bolts(model):
     res = cutter.generate(model, cs)
     for cut_json, lay in zip(pv["cuts"], res.lays):
         assert np.allclose([b["xy"] for b in cut_json["bolts"]], lay.pts, atol=1e-3)
-        assert cut_json["bands"] and cut_json["frame"]["normal"]
+        assert cut_json["crossings"] and cut_json["free"] and cut_json["frame"]["normal"]
 
 
 def test_each_cut_has_its_own_settings(model):
@@ -204,23 +259,34 @@ def test_each_cut_has_its_own_settings(model):
     assert any(s.startswith("M3") for s in specs) and any(s.startswith("M6") for s in specs)
 
 
-def test_parallel_cuts(model):
-    near = dict(ACROSS_Z, plane={"origin": [0, 0, 125], "normal": [0, 0, 1]})
-    with pytest.raises(CutError, match="too close together"):
-        cutter.preview(model, cuts(ACROSS_Z, near))
-    close = dict(ACROSS_Z, plane={"origin": [0, 0, 135], "normal": [0, 0, 1]})
-    assert "cuts_close" in {w["code"] for w in cutter.preview(model, cuts(ACROSS_Z, close))["warnings"]}
+def test_parallel_cuts_too_close(model):
+    near = dict(ACROSS_Z, plane={"origin": [500, 0, 125], "normal": [0, 0, 1]})   # origin far away on purpose
+    pv = cutter.preview(model, cuts(ACROSS_Z, near))
+    assert pv["cuts"][0]["error"] is None and "too close" in pv["cuts"][1]["error"]
+    with pytest.raises(CutError, match="too close"):
+        cutter.generate(model, cuts(ACROSS_Z, near))
+    close = dict(ACROSS_Z, plane={"origin": [0, 0, 135], "normal": [0, 0, 1]})   # flanges fit, tools do not
+    pv = cutter.preview(model, cuts(ACROSS_Z, close))
+    assert all(c["count"] == 0 and "no_bolts" in {w["code"] for w in c["warnings"]} for c in pv["cuts"])
+
+
+def test_one_bad_cut_does_not_hide_the_others(model):
+    away = {"plane": {"origin": [0, 0, 900], "normal": [0, 0, 1]}}
+    pv = cutter.preview(model, cuts(LENGTHWISE, away))
+    assert pv["cuts"][0]["error"] is None and pv["cuts"][0]["count"] == 8
+    assert "does not go through the model" in pv["cuts"][1]["error"]
 
 
 # ---------------------------------------------------------------- bad inputs
 def test_plane_misses_the_model(model):
+    pv = cutter.preview(model, cuts({"plane": {"origin": [0, 0, 500], "normal": [0, 0, 1]}}))
+    assert "does not go through the model" in pv["cuts"][0]["error"]
     with pytest.raises(CutError, match="does not go through the model"):
-        cutter.preview(model, cuts({"plane": {"origin": [0, 0, 500], "normal": [0, 0, 1]}}))
+        cutter.generate(model, cuts({"plane": {"origin": [0, 0, 500], "normal": [0, 0, 1]}}))
 
 
 def test_too_many_bolts(model):
-    with pytest.raises(CutError, match="too many bolts"):
-        cutter.preview(model, cuts(dict(TRANSVERSE, count=100)))
+    assert "too many bolts" in cutter.preview(model, cuts(dict(TRANSVERSE, count=100)))["cuts"][0]["error"]
 
 
 def test_non_watertight_mesh():
@@ -269,7 +335,7 @@ def test_bad_settings(raw, message):
 def test_cut_count_limits():
     with pytest.raises(CutError, match="at least one cut"):
         cutter.parse_cuts({"cuts": []})
-    with pytest.raises(CutError, match="at most 6"):
+    with pytest.raises(CutError, match="up to 6 cuts"):
         cutter.parse_cuts({"cuts": [LENGTHWISE] * 7})
 
 

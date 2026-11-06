@@ -82,6 +82,8 @@ PARAMS: tuple[Param, ...] = (
           "Thickness of the flange on each part. Empty = automatic.", advanced=False),
     Param("width", "Flange width", "mm", 4.0, 80.0, None,
           "How far the flange sticks out from the wall. Empty = automatic.", advanced=False),
+    Param("hole_diameter", "Hole diameter", "mm", 2.0, 14.0, None,
+          "Diameter of the bolt holes. Empty = automatic: ISO hole plus the extra hole size.", advanced=False),
     Param("wall_gap", "Gap washer to wall", "mm", 0.0, 10.0, 1.0,
           "Free space between the washer and the wall."),
     Param("edge", "Edge margin", "mm", 0.0, 20.0, 2.0,
@@ -141,6 +143,15 @@ class Derived:
     def min_spacing(self) -> float:
         return self.bolt.washer + SPACING_PLAY
 
+    @property
+    def protrusion(self) -> float:
+        """How far hardware sticks out of a flange face: bolt end (behind washer and nut) or head.
+
+        Head height taken as the nominal diameter (socket head, ISO 4762); a hex head is lower.
+        """
+        length = self.bolt_length or (self.grip + BOLT_PROTRUSION)
+        return max(length - 2 * self.thickness - self.bolt.washer_t, self.bolt.washer_t + self.bolt.d)
+
     def as_dict(self) -> dict:
         return {"thickness": round(self.thickness, 2), "width": self.width,
                 "hole_diameter": round(self.hole_d, 2), "washer": self.bolt.washer,
@@ -190,8 +201,16 @@ def derive(bolt_name: str, fastening_key: str, params: dict) -> Derived:
             "no_bolt_length", f"No standard bolt up to {STANDARD_LENGTHS[-1]} mm is long enough "
                               f"(you need {grip + BOLT_PROTRUSION:.0f} mm).",
             "Make the flange thinner, or buy longer bolts."))
+    hole_d = p["hole_diameter"] or bolt.hole + p["hole_clearance"]
+    if hole_d < bolt.d + 0.1:
+        warnings.append(warning("hole_small", f"The holes ({hole_d:g} mm) are not bigger than the "
+                                              f"{bolt.name} bolt.", "Make the holes bigger, or leave the hole "
+                                                                     "diameter empty for the automatic size."))
+    elif hole_d > bolt.washer - 1.0:
+        warnings.append(warning("hole_large", f"The holes ({hole_d:g} mm) are almost as big as the washer.",
+                                "Make the holes smaller, or use a bigger washer."))
     return Derived(bolt=bolt, fastening=fastening, thickness=float(thickness), width=p["width"],
-                   wall_gap=p["wall_gap"], edge=p["edge"], hole_d=bolt.hole + p["hole_clearance"],
+                   wall_gap=p["wall_gap"], edge=p["edge"], hole_d=float(hole_d),
                    overlap=p["overlap"], max_wall_angle=p["max_wall_angle"],
                    tool_clearance=p["tool_clearance"], end_margin=p["end_margin"],
                    grip=grip, bolt_length=length, pocket_af=af, pocket_depth=depth, warnings=warnings)

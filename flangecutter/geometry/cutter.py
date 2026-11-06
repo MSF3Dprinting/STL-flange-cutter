@@ -9,11 +9,12 @@ plane coordinates (cut plane = z 0, cut normal = +z):
 3. generate  one 3D build for all cuts: mold + flange slabs - holes - nut pockets, and only
              THEN split by every plane (splitting last keeps every part watertight)
 
-Cuts may cross. Bolts keep out of a band around each crossing, so holes, washers and tools stay
-clear of the other cut's flange (docs/ARCHITECTURE.md, "Crossing cuts").
+Cuts may cross. Bolts keep far enough from every other cut that their holes, washers, nuts,
+bolt ends and tools clear the other cut's flange and hardware (docs/ARCHITECTURE.md).
 """
 from __future__ import annotations
 
+import io
 import math
 import time
 from collections import Counter
@@ -26,7 +27,7 @@ import trimesh
 from manifold3d import CrossSection, Manifold, OpType
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.geometry.polygon import orient
-from shapely.ops import linemerge, unary_union
+from shapely.ops import linemerge, substring, unary_union
 
 from . import CutError, warning
 from .bolts import (BOLTS, COUNT_RANGE, DEFAULT_SPACING, FASTENINGS, MAX_CUTS, SPACING_RANGE,
@@ -34,13 +35,14 @@ from .bolts import (BOLTS, COUNT_RANGE, DEFAULT_SPACING, FASTENINGS, MAX_CUTS, S
 from .mesh_io import Model, stl_bytes
 
 SIDES = ("outside", "inside")
-GAP_STEPS = 6                              # bolt line may move out by up to 6 x 1 mm
-BLOCK_VOLUME = 0.01                        # mm3; another flange overlapping a tool cylinder more blocks it
-BLOCK_AREA = 0.01                          # mm2; a tool disc overlapping the mold's shadow more is blocked
-PARALLEL_SIN = math.sin(math.radians(5))   # planes closer than 5 deg to parallel do not "cross"
-SHALLOW_DEG = 30.0
-SMALL_PART_CM3 = 0.5
-FLIP = np.diag([1.0, -1.0, -1.0, 1.0])     # 180 deg about the plane x axis (print orientation of side B)
+GAP_STEPS = 6                      # the bolt line may move out by up to 6 x 1 mm
+BLOCK_AREA = 0.01                  # mm2: a tool disc overlapping the mold's shadow more is blocked
+GRID = 0.01                        # mm: flange outlines are snapped to this grid (see _snap)
+SAMPLE = 0.5                       # mm: bolt lines are checked against other cuts at this step
+MIN_CROSS_DEG, SHALLOW_DEG = 15.0, 30.0
+SMALL_PART_CM3, MOSTLY_FLANGE = 0.5, 0.25
+OVERHANG_NZ = -math.cos(math.radians(45))   # faces looking down more steeply than 45 deg need support
+FLIP = np.diag([1.0, -1.0, -1.0, 1.0])     # 180 deg about the plane x axis (print position of side B)
 Progress = Callable[[str, float], None]
 
 
@@ -100,10 +102,10 @@ def plane_frame(origin, normal, x_axis=None) -> Plane:
 def _segment_shift(base: np.ndarray) -> float:
     """Offset (mm) for the trimesh outline so that no vertex lies on it.
 
-    Vertices exactly on the plane (e.g. "Across Z" through a ring of vertices) make
-    mesh_plane return duplicate edges. Only the 2D outline uses the shifted plane (1 um away);
-    Manifold slices and splits at the exact plane, which it handles robustly. Moving the
-    3D split instead would leave 1 um sliver triangles that break after float32 STL export.
+    Vertices exactly on the plane (e.g. "Across Z" through a ring of vertices) make mesh_plane
+    return duplicate edges. Only the 2D outline uses the shifted plane (1 um away); Manifold
+    slices and splits at the exact plane, which it handles robustly. Moving the 3D split instead
+    leaves 1 um sliver triangles that break after float32 STL export.
     """
     for k in range(21):
         s = 0.001 * ((k + 1) // 2) * (1 if k % 2 else -1)     # 0, +1, -1, +2, -2 ... um
@@ -124,7 +126,7 @@ class Cut:
     mode: str            # "count" or "spacing"
     count: int
     spacing: float
-    pocket_half: str     # "A" or "B": which part of this cut holds the nut pockets
+    pocket_half: str     # "A" or "B": which side of this cut holds the nut pockets
     settings: dict       # normalised copy for settings.json
 
     @property
@@ -140,7 +142,7 @@ def parse_cuts(payload: dict) -> list[Cut]:
     if not isinstance(raw, list) or not raw:
         raise CutError("Add at least one cut.")
     if len(raw) > MAX_CUTS:
-        raise CutError(f"Use at most {MAX_CUTS} cuts.")
+        raise CutError(f"You can use up to {MAX_CUTS} cuts.")
     return [_parse_cut(r, i) for i, r in enumerate(raw)]
 
 
@@ -159,12 +161,12 @@ def _parse_cut(r: dict, i: int) -> Cut:
         plane = plane_frame(pl.get("origin"), pl.get("normal"), pl.get("x_axis"))
     except (TypeError, ValueError) as exc:
         if isinstance(exc, CutError):
-            raise
+            raise CutError(f"{label}: {exc.message[0].lower()}{exc.message[1:]}", exc.detail) from None
         raise CutError(f"{label}: the cut plane is not valid.", repr(pl)) from None
     side = _pick(r.get("side", "outside"), SIDES, "flange side", label)
     bolt = _pick(r.get("bolt", "M4"), BOLTS, "bolt size", label)
     fastening = _pick(r.get("fastening", "through_nut"), FASTENINGS, "fastening", label)
-    half = _pick(r.get("nut_pocket_half", "B"), ("A", "B"), "nut pocket part", label)
+    half = _pick(r.get("nut_pocket_half", "B"), ("A", "B"), "nut pocket side", label)
     dist = r.get("distribution") or {}
     mode = _pick(dist.get("mode", "count"), ("count", "spacing"), "bolt distribution", label)
     try:
@@ -209,6 +211,20 @@ def _shapely_to_cs(g) -> CrossSection:
     return CrossSection(contours)
 
 
+def _polygons(g) -> list[Polygon]:
+    return [p for p in getattr(g, "geoms", [g]) if p.geom_type == "Polygon" and not p.is_empty]
+
+
+def _snap(g):
+    """Snap an outline to a 0.01 mm grid.
+
+    Outline vertices made from chain ends lie exactly on the mold surface (e.g. at a rim). Manifold
+    then leaves edges under 1 um that collapse in a float32 STL, so the part is no longer watertight.
+    Snapping moves them into general position (5 um at most).
+    """
+    return shapely.set_precision(g, GRID)
+
+
 def _chains(seg: np.ndarray) -> list[LineString]:
     """Merge outline segments into polylines (chains); drop crumbs under 1 mm."""
     if len(seg) == 0:
@@ -246,6 +262,17 @@ def _side_band(ch: LineString, s: float, dist: float, join: str = "round"):
     return poly.buffer(dist, join_style=join, quad_segs=16).difference(poly)
 
 
+def _prolonged(ch: LineString, d: float) -> LineString:
+    """An open chain extended by d along its end directions (closed rings are returned as is)."""
+    if ch.is_closed:
+        return ch
+    p = np.asarray(ch.coords)
+    k = min(1.0, ch.length / 2)
+    t0 = p[0] - np.asarray(ch.interpolate(k).coords[0])
+    t1 = p[-1] - np.asarray(ch.interpolate(ch.length - k).coords[0])
+    return LineString(np.vstack([p[0] + d * t0 / np.linalg.norm(t0), p, p[-1] + d * t1 / np.linalg.norm(t1)]))
+
+
 # ---------------------------------------------------------------- 1. section
 @dataclass
 class Section:
@@ -253,7 +280,8 @@ class Section:
 
     plane: Plane
     area: object                 # shapely geometry of the wall section
-    cavity: np.ndarray           # 2D reference point inside the cavity (centroid of the convex hull)
+    cavities: np.ndarray         # (k, 2) cavity reference per connected region (centroid of its hull)
+    points: np.ndarray           # (n, 3) section outline in world coordinates
     f_chains: list               # chains on the flange side, with their outward signs
     f_signs: list
     g_chains: list               # chains on the cavity side (guard band)
@@ -288,13 +316,17 @@ def _segments(model: Model, plane: Plane, dots: np.ndarray, z: float) -> tuple:
     return seg, n2, np.degrees(np.arcsin(np.clip(np.abs(nf[:, 2]), 0, 1)))
 
 
-def _split_chains(seg: np.ndarray, n2: np.ndarray, cavity: np.ndarray, side: str) -> tuple:
-    """Chains on the flange side and on the guard side, each with its outward signs (POC step 2):
-    a segment faces away from the cavity when its normal points away from the reference point."""
+def _split_chains(seg, n2, regions: shapely.STRtree, refs: np.ndarray, side: str) -> tuple:
+    """Chains on the flange side and on the guard side, each with its outward signs (POC step 2).
+
+    A segment faces away from the cavity when its normal points away from the reference point of
+    its own region of the section (each separate wall loop has its own cavity).
+    """
     if len(seg) == 0:
         return [], [], [], [], np.zeros(0, bool)
     mids = seg.mean(axis=1)
-    away = np.einsum("ij,ij->i", n2, mids - cavity) > 0
+    ref = refs[regions.nearest(shapely.points(mids))]
+    away = np.einsum("ij,ij->i", n2, mids - ref) > 0
     mask = away if side == "outside" else ~away
     tree = shapely.STRtree(shapely.points(mids))
     f, g = _chains(seg[mask]), _chains(seg[~mask])
@@ -305,26 +337,27 @@ def _section(model: Model, cut: Cut) -> Section:
     plane = cut.plane
     dots = (model.mesh.vertices - plane.origin) @ plane.normal
     if dots.min() > -0.05 or dots.max() < 0.05:
-        raise CutError(f"{cut.label}: the cut plane does not go through the model. Move it so it crosses "
-                       "the model.", f"vertex distances {dots.min():.3f} .. {dots.max():.3f}")
+        raise CutError(f"{cut.label} does not go through the model. Drag it onto the model or delete it.",
+                       f"vertex distances {dots.min():.3f} .. {dots.max():.3f}")
     mp = model.manifold.transform(plane.to_plane())               # this cut plane is now z = 0
     area = _cs_to_shapely(mp.slice(0.0))
+    polys = [p for p in _polygons(area) if p.area > 1e-6]
     seg, n2, lean = _segments(model, plane, dots, 0.0)
-    if area.is_empty or len(seg) == 0:
-        raise CutError(f"{cut.label}: the cut plane does not go through the model.")
-    cavity = np.asarray(area.convex_hull.centroid.coords[0])
-    f_chains, f_signs, g_chains, g_signs, mask = _split_chains(seg, n2, cavity, cut.side)
+    if not polys or len(seg) == 0:
+        raise CutError(f"{cut.label} does not go through the model. Drag it onto the model or delete it.")
+    regions = shapely.STRtree([p.boundary for p in polys])
+    refs = np.array([p.convex_hull.centroid.coords[0] for p in polys])
+    f_chains, f_signs, g_chains, g_signs, mask = _split_chains(seg, n2, regions, refs, cut.side)
     if not mask.any():
         raise CutError(f"{cut.label}: no wall faces the {cut.side} here. Choose the other flange side.")
     if not f_chains:
-        raise CutError(f"{cut.label}: the cut is too small for a flange. Move the cut plane.")
+        raise CutError(f"{cut.label}: the cut is too small for a flange. Move the cut.")
     # cavity-side chains at the outer face of each flange half (z = +T and -T), for leaning walls
     T, H = cut.d.thickness, cut.d.tool_clearance
     g_levels = []
     for z in (T, -T):
         seg_z, n2_z, _ = _segments(model, plane, dots, z)
-        g_levels.append(_split_chains(seg_z, n2_z, cavity, cut.side)[2:4])
-
+        g_levels.append(_split_chains(seg_z, n2_z, regions, refs, cut.side)[2:4])
     shadow = None
     if H > 0:
         # The POC's tool cylinder runs from 0.01 mm above each flange face over the tool clearance H.
@@ -335,47 +368,9 @@ def _section(model: Model, cut: Cut) -> Section:
         boxes = (Manifold.cube(size).translate((x0 - 1, y0 - 1, T + 0.01))
                  + Manifold.cube(size).translate((x0 - 1, y0 - 1, -T - 0.01 - H)))
         shadow = _cs_to_shapely((mp ^ boxes).project())
-    return Section(plane, area, cavity, f_chains, f_signs, g_chains, g_signs, g_levels[0], g_levels[1],
-                   float(np.percentile(lean[mask], 95)), shadow)
-
-
-# ---------------------------------------------------------------- crossings
-@dataclass
-class Band:
-    """Bolt-free band around the line where another cut crosses this one: |a . p - c| < half."""
-
-    other: int
-    a: np.ndarray
-    c: float
-    half: float
-
-
-def _bands(cut: Cut, others: list[Cut]) -> list[Band]:
-    """One band per crossing cut.
-
-    A point at in-plane distance d from the crossing line, lifted by z along this normal, is
-    |d sin(t) + z cos(t)| from the other plane (t = angle between the planes). Holes, washers and
-    tools reach |z| <= T + H, so they clear the other flange (|dist| <= T_other) when
-    |d| >= (T_other + r + (T + H) |cos t|) / sin t.
-    """
-    out = []
-    for o in others:
-        nj = cut.plane.R @ o.plane.normal                 # other normal, in this cut's frame
-        sin = float(np.hypot(nj[0], nj[1]))
-        if sin < PARALLEL_SIN:
-            continue
-        a = nj[:2] / sin
-        c = float(nj @ cut.plane.local(o.plane.origin)) / sin
-        reach = cut.d.thickness + max(cut.d.tool_clearance, 1.0)
-        half = (o.d.thickness + cut.d.envelope_r + reach * abs(nj[2])) / sin + 0.5
-        out.append(Band(o.index, a, c, half))
-    return out
-
-
-def _band_shape(b: Band, half: float, size: float = 1e4):
-    t = np.array([-b.a[1], b.a[0]])
-    mid = b.a * b.c
-    return LineString([mid - size * t, mid + size * t]).buffer(half, cap_style="flat")
+    outline = np.vstack([np.asarray(r.coords) for p in polys for r in [p.exterior, *p.interiors]])
+    return Section(plane, area, refs, plane.world(outline), f_chains, f_signs, g_chains, g_signs,
+                   g_levels[0], g_levels[1], float(np.percentile(lean[mask], 95)), shadow)
 
 
 # ---------------------------------------------------------------- 2. layout
@@ -390,25 +385,17 @@ class Layout:
     c: float                     # bolt line distance from the wall
     W: float                     # flange width
     moved: float                 # how far the bolt line was moved out, mm
-    blocked: list[int]           # bolt indices whose tool space is blocked
+    blocked: list[int]           # bolts whose tool space is blocked by the wall
     suggested: int
-    bands: list[Band]
+    lines: list                  # the whole bolt line(s) ...
+    pieces: list                 # ... and the stretches where bolts may go (clear of other cuts)
+    empty: int                   # stretches too short for any bolt
+    culprits: set                # other cuts that kept bolts away from stretches of this cut
     warnings: list[dict] = field(default_factory=list)
 
     @property
     def uniform(self) -> bool:
         return self.flange_a is self.flange and self.flange_b is self.flange
-
-
-def _prolonged(ch: LineString, d: float) -> LineString:
-    """An open chain extended by d along its end directions (closed rings are returned as is)."""
-    if ch.is_closed:
-        return ch
-    p = np.asarray(ch.coords)
-    k = min(1.0, ch.length / 2)
-    t0 = p[0] - np.asarray(ch.interpolate(k).coords[0])
-    t1 = p[-1] - np.asarray(ch.interpolate(ch.length - k).coords[0])
-    return LineString(np.vstack([p[0] + d * t0 / np.linalg.norm(t0), p, p[-1] + d * t1 / np.linalg.norm(t1)]))
 
 
 def _guard(chains: list, signs: list, W: float):
@@ -426,53 +413,90 @@ def _flange_outline(sec: Section, d: Derived, W: float) -> tuple:
 
     Each half also loses the guard band found at its own outer face (z = +T or -T): where the wall
     leans, the straight flange slab would otherwise poke through the wall into the cavity.
+    Returns (cut face outline, side-A outline, side-B outline).
     """
     parts = []
     for ch, s in zip(sec.f_chains, sec.f_signs):
         parts += [_side_band(ch, s, W), _side_band(ch, -s, d.overlap, "mitre")]
     flange = unary_union(parts)
     guard = _guard(sec.g_chains, sec.g_signs, W)
-    flange = (flange.difference(guard) if guard is not None else flange).buffer(0)
+    flange = _snap(flange.difference(guard) if guard is not None else flange)
     halves = []
     for chains, signs in (sec.g_top, sec.g_bottom):
         g = _guard(chains, signs, W)
-        half = flange.difference(g).buffer(0) if g is not None else flange
+        half = _snap(flange.difference(g)) if g is not None else flange
         halves.append(flange if half.area > flange.area - 1e-6 else half)    # unchanged: share the object
-    cut_face = flange if halves[0] is flange or halves[1] is flange else unary_union(halves)
+    cut_face = flange if halves[0] is flange or halves[1] is flange else _snap(unary_union(halves))
     return cut_face, halves[0], halves[1]
 
 
-def _bolt_lines(sec: Section, c: float, end: float, bands: list[Band]) -> list[tuple]:
-    """Bolt line pieces as (line, closed, margin at start, margin at end).
+def _clear_of_others(cut: Cut, plane: Plane, line: LineString, others: list[Cut]) -> tuple:
+    """Sample a bolt line and keep the points where a bolt clears every other cut.
 
-    The bolt line is each flange chain offset by c. Crossing bands cut it into pieces; a piece
-    end made by a band needs no margin (the band already holds the washer), an open chain end
-    keeps the POC end margin.
+    A bolt's hardware and tools reach R = T + tool clearance along its own normal and r = washer/2 + 0.5
+    sideways. At a sample p, the closest that reaches to another plane j is
+    max(0, |dist(p, P_j)| - R |cos|) - r sin  (cos, sin of the angle between the planes); it must
+    stay beyond flange j (T_j) and the bolt ends, nuts and heads sticking out of it (protrusion_j).
     """
-    cutter = unary_union([_band_shape(b, b.half) for b in bands]) if bands else None
-    out = []
-    for ch, s in zip(sec.f_chains, sec.f_signs):
-        line = ch.offset_curve(s * c, quad_segs=16, join_style="round")
+    s = np.linspace(0.0, line.length, max(2, math.ceil(line.length / SAMPLE) + 1))
+    p = plane.world(shapely.get_coordinates(shapely.line_interpolate_point(line, s)))
+    d = cut.d
+    reach = d.thickness + max(d.tool_clearance, d.protrusion)
+    ok, culprits = np.ones(len(s), bool), set()
+    for o in others:
+        cos = abs(float(plane.normal @ o.plane.normal))
+        sin = math.sqrt(max(0.0, 1.0 - cos * cos))
+        dist = np.abs((p - o.plane.origin) @ o.plane.normal)
+        bad = np.maximum(0.0, dist - reach * cos) - d.envelope_r * sin < o.d.thickness + o.d.protrusion + 0.5
+        if bad.any():
+            culprits.add(o.index)
+            ok &= ~bad
+    return s, ok, culprits
+
+
+def _runs(s: np.ndarray, ok: np.ndarray, closed: bool) -> list[tuple[float, float, bool, bool]]:
+    """Stretches (start, end, starts at line start, ends at line end) where ok is True."""
+    edges = np.flatnonzero(np.diff(np.r_[0, ok.astype(int), 0]))
+    runs = [(s[a], s[b - 1], a == 0, b == len(s)) for a, b in zip(edges[::2], edges[1::2]) if b - 1 > a]
+    if closed and len(runs) > 1 and runs[0][2] and runs[-1][3]:      # joined across the ring's seam
+        runs = [(runs[-1][0], runs[0][1], False, False)] + runs[1:-1]
+    return runs
+
+
+def _bolt_lines(cut: Cut, sec: Section, c: float, others: list[Cut]) -> tuple[list, list, set]:
+    """The bolt line (each flange chain offset by c) and its stretches where bolts may go.
+
+    Stretches are (line, closed, margin at start, margin at end). An open chain end keeps the POC
+    end margin; a stretch end made by another cut needs none (the clearance test holds the washer).
+    """
+    end = c + cut.d.bolt.washer / 2 + cut.d.end_margin
+    lines, out, culprits = [], [], set()
+    for ch, sgn in zip(sec.f_chains, sec.f_signs):
+        line = ch.offset_curve(sgn * c, quad_segs=16, join_style="round")
         if line.is_empty:
             continue
         if line.geom_type != "LineString":
             line = max(line.geoms, key=lambda g: g.length)
-        if cutter is None or not line.intersects(cutter):
-            out.append((line, ch.is_closed, end, end))
+        closed = ch.is_closed
+        lines.append(line)
+        s, ok, who = _clear_of_others(cut, sec.plane, line, others)
+        culprits |= who
+        if ok.all():
+            out.append((line, closed, end, end))
             continue
-        rest = line.difference(cutter)
-        if rest.is_empty:
-            continue
-        rest = linemerge(rest) if rest.geom_type == "MultiLineString" else rest
-        ends = [] if ch.is_closed else [Point(line.coords[0]), Point(line.coords[-1])]
-        for piece in ([rest] if rest.geom_type == "LineString" else list(rest.geoms)):
-            m = [end if any(Point(piece.coords[k]).distance(e) < 1e-6 for e in ends) else 0.0 for k in (0, -1)]
-            out.append((piece, False, m[0], m[1]))
-    return out
+        for a, b, at_start, at_end in _runs(s, ok, closed):
+            if a < b:
+                piece = substring(line, a, b)
+            else:   # wraps over the seam of a ring
+                piece = LineString(list(substring(line, a, line.length).coords) + list(substring(line, 0, b).coords)[1:])
+            m0 = end if at_start and not closed else 0.0
+            m1 = end if at_end and not closed else 0.0
+            out.append((piece, False, m0, m1))
+    return lines, out, culprits
 
 
 def _allocate(n: int, weights: np.ndarray, caps: np.ndarray) -> np.ndarray:
-    """Share n bolts over pieces by length: at least 2 per piece where they fit, largest remainder."""
+    """Share n bolts over stretches by length: at least 2 per stretch where they fit, largest remainder."""
     mins = np.minimum(2, caps)
     ideal = n * weights / max(weights.sum(), 1e-9)
     alloc = np.clip(np.floor(ideal).astype(int), mins, caps)
@@ -483,9 +507,11 @@ def _allocate(n: int, weights: np.ndarray, caps: np.ndarray) -> np.ndarray:
     return alloc
 
 
-def _place_bolts(cut: Cut, pieces: list[tuple]) -> tuple[np.ndarray, int, int]:
-    """Bolt positions by arc length (POC step 4). Returns points, capacity and suggested count."""
+def _place_bolts(cut: Cut, pieces: list[tuple], culprits: set) -> tuple[np.ndarray, int, int]:
+    """Bolt positions by arc length (POC step 4). Returns points, suggested count, empty stretches."""
     d = cut.d
+    if not pieces:
+        return np.zeros((0, 2)), 0, 0
     lengths = np.array([p[0].length for p in pieces], float)
     usable = np.array([L if closed else L - m0 - m1 for (_, closed, m0, m1), L in zip(pieces, lengths)])
     caps = np.array([int(u // d.min_spacing) if closed else (int(u // d.min_spacing) + 1 if u >= 0 else 0)
@@ -499,9 +525,10 @@ def _place_bolts(cut: Cut, pieces: list[tuple]) -> tuple[np.ndarray, int, int]:
         alloc = np.clip(target, np.minimum(2, caps), caps)
     else:
         if 0 < total_cap < cut.count:
+            near = f" Other cuts keep bolts away from part of it ({_cut_names(culprits)})." if culprits else ""
             raise CutError(f"{cut.label}: too many bolts. At most {total_cap} {d.bolt.name} bolts fit along "
-                           f"this cut, {d.min_spacing:g} mm apart. Lower the bolt count.",
-                           f"capacity per piece {caps.tolist()}")
+                           f"this cut, {d.min_spacing:g} mm apart.{near} Lower the bolt count.",
+                           f"capacity per stretch {caps.tolist()}")
         alloc = _allocate(cut.count, usable.clip(0), caps)
     pts = []
     for (line, closed, m0, _), L, u, n in zip(pieces, lengths, usable, alloc):
@@ -512,7 +539,12 @@ def _place_bolts(cut: Cut, pieces: list[tuple]) -> tuple[np.ndarray, int, int]:
         else:
             s = np.linspace(m0, m0 + u, n) if n > 1 else np.array([m0 + u / 2])
         pts.append(shapely.get_coordinates(shapely.line_interpolate_point(line, s)))
-    return (np.vstack(pts) if pts else np.zeros((0, 2))), total_cap, suggested
+    empty = int(np.sum((alloc == 0) & (lengths > 1.0)))
+    return (np.vstack(pts) if pts else np.zeros((0, 2))), suggested, empty
+
+
+def _cut_names(indices) -> str:
+    return ", ".join(f"cut {i + 1}" for i in sorted(indices))
 
 
 def _blocked(sec: Section, d: Derived, pts: np.ndarray) -> list[int]:
@@ -528,29 +560,28 @@ def _blocked(sec: Section, d: Derived, pts: np.ndarray) -> list[int]:
     return [int(i) for i in np.flatnonzero(shapely.area(shapely.intersection(discs, sec.shadow)) > BLOCK_AREA)]
 
 
-def layout(cut: Cut, sec: Section, bands: list[Band]) -> Layout:
+def layout(cut: Cut, sec: Section, others: list[Cut]) -> Layout:
     """Flange and bolts of one cut. Moves the bolt line out 1 mm at a time while tools are blocked."""
     d = cut.d
     best = None
     for k in range(GAP_STEPS + 1):
         c = d.bolt_line(k)
-        W = d.flange_width(c)
-        pieces = _bolt_lines(sec, c, c + d.bolt.washer / 2 + d.end_margin, bands)
+        lines, pieces, culprits = _bolt_lines(cut, sec, c, others)
         try:
-            pts, _, suggested = _place_bolts(cut, pieces)
+            pts, suggested, empty = _place_bolts(cut, pieces, culprits)
         except CutError:
             if k == 0:
                 raise
             break                    # a moved bolt line got too short for the count: keep the best so far
         blocked = _blocked(sec, d, pts)
         if best is None or len(blocked) < len(best[3]):
-            best = (k, c, W, blocked, pts, suggested)
+            best = (k, c, d.flange_width(c), blocked, pts, suggested, lines, pieces, empty, culprits)
         if not blocked:
             break
-    k, c, W, blocked, pts, suggested = best
-    lay = Layout(*_flange_outline(sec, d, W), pts, c, W, float(k), blocked, suggested, bands,
-                 [dict(w, message=f"{cut.label}: {w['message'][0].lower()}{w['message'][1:]}")
-                  for w in d.warnings])
+    k, c, W, blocked, pts, suggested, lines, pieces, empty, culprits = best
+    lay = Layout(*_flange_outline(sec, d, W), pts, c, W, float(k), blocked, suggested, lines, pieces,
+                 empty, culprits, [dict(w, message=f"{cut.label}: {w['message'][0].lower()}{w['message'][1:]}")
+                                   for w in d.warnings])
     _check_layout(cut, sec, lay)
     return lay
 
@@ -563,11 +594,17 @@ def _check_layout(cut: Cut, sec: Section, lay: Layout) -> None:
         w.append(warning("wall_angle", f"{label}: the wall meets the cut at up to {sec.lean_p95:.0f}° from square.",
                          "The flange may not sit flat. Rotate the cut so it crosses the wall more squarely."))
     if n == 0:
-        w.append(warning("no_bolts", f"{label}: there is no room for bolts on this cut.",
-                         "Move the cut away from the other cuts, or make the flange wider."))
+        why = f" because {_cut_names(lay.culprits)} {'is' if len(lay.culprits) == 1 else 'are'} too close" \
+            if lay.culprits else ""
+        w.append(warning("no_bolts", f"{label}: there is no room for bolts on this cut{why}.",
+                         "Move the cuts further apart, or lower the tool clearance."))
         return
+    if lay.empty:
+        w.append(warning("unbolted_stretch", f"{label}: {lay.empty} stretch(es) of this cut are too short for a "
+                                             f"bolt, next to {_cut_names(lay.culprits) or 'the end of the flange'}.",
+                         "The parts may not be bolted there. Move the cuts so each stretch is longer."))
     if cut.mode == "count" and n > cut.count:
-        w.append(warning("count_raised", f"{label}: each separate stretch of wall needs 2 bolts, so {n} bolts "
+        w.append(warning("count_raised", f"{label}: each separate stretch of the cut needs 2 bolts, so {n} bolts "
                                          f"are used instead of {cut.count}.", "No action needed."))
     if lay.blocked:
         w.append(warning("bolts_blocked", f"{label}: the wall blocks the tool space at bolt "
@@ -596,6 +633,195 @@ def _numbers(idx) -> str:
 
 
 # ---------------------------------------------------------------- all cuts together
+@dataclass
+class Plan:
+    """Sections, layouts and errors of all cuts. One bad cut does not stop the others."""
+
+    cuts: list[Cut]
+    secs: list[Section | None]
+    lays: list[Layout | None]
+    errors: list[str | None]
+    warnings: list[dict]
+
+    def raise_errors(self) -> None:
+        errors = [e for e in self.errors if e]
+        if errors:
+            raise CutError(" ".join(errors), f"{len(errors)} cut(s) with errors")
+
+
+def _check_pairs(cuts: list[Cut], secs: list, errors: list) -> list[dict]:
+    """Two cuts must either cross inside the wall at a fair angle, or stay clear of each other.
+
+    Decided from where each plane lies relative to the other cut's wall section, never from the
+    plane origins (which can sit anywhere on the plane).
+    """
+    out = []
+    for i, a in enumerate(cuts):
+        for b in cuts[i + 1:]:
+            sa, sb = secs[a.index], secs[b.index]
+            if sa is None or sb is None:
+                continue
+            da = (sa.points - b.plane.origin) @ b.plane.normal
+            db = (sb.points - a.plane.origin) @ a.plane.normal
+            sin = min(1.0, float(np.linalg.norm(np.cross(a.plane.normal, b.plane.normal))))
+            angle = math.degrees(math.asin(sin))
+            if da.min() < 0 < da.max() or db.min() < 0 < db.max():          # they cross inside the wall
+                if angle < MIN_CROSS_DEG:
+                    errors[b.index] = errors[b.index] or (
+                        f"{b.label} crosses {a.label.lower()} inside the model at only {angle:.0f}°. Make the cuts "
+                        f"cross at {SHALLOW_DEG:.0f}° or more, or move them apart.")
+                elif angle < SHALLOW_DEG:
+                    out.append(warning("shallow_crossing", f"{a.label} and {b.label.lower()} cross at {angle:.0f}°.",
+                                       f"The flanges merge where the cuts cross. Cross at {SHALLOW_DEG:.0f}° or more."))
+                continue
+            gap = min(np.abs(da).min(), np.abs(db).min())
+            widest = max(x.d.flange_width(x.d.bolt_line(GAP_STEPS)) for x in (a, b))
+            need = a.d.thickness + b.d.thickness + 2.0 + widest * sin
+            if gap < need:
+                errors[b.index] = errors[b.index] or (
+                    f"{b.label} is too close to {a.label.lower()}: their flanges would overlap. Move the cuts "
+                    f"at least {math.ceil(need)} mm apart.")
+    return out
+
+
+def _offcut_warnings(cuts: list[Cut], secs: list, lays: list) -> list[dict]:
+    """A plane that crosses another cut's flange outside the wall cuts off a loose piece of flange."""
+    out = []
+    for a in cuts:
+        sa, la = secs[a.index], lays[a.index]
+        if la is None:
+            continue
+        pts = sa.plane.world(shapely.get_coordinates(la.flange))
+        for b in cuts:
+            if b is a or secs[b.index] is None:
+                continue
+            df = (pts - b.plane.origin) @ b.plane.normal
+            ds = (sa.points - b.plane.origin) @ b.plane.normal
+            if df.min() < 0 < df.max() and not ds.min() < 0 < ds.max():
+                out.append(warning("flange_offcut", f"{b.label} cuts through the flange of {a.label.lower()} outside "
+                                                    "the wall. That piece of flange will be left out.",
+                                   f"Move {b.label.lower()} so it crosses the wall of {a.label.lower()}, or away from it."))
+    return out
+
+
+def plan(model: Model, cuts: list[Cut]) -> Plan:
+    """Sections, flange outlines and bolts for all cuts. Shared by preview and generate."""
+    errors: list[str | None] = [None] * len(cuts)
+    secs: list[Section | None] = [None] * len(cuts)
+    for c in cuts:
+        try:
+            secs[c.index] = section(model, c)
+        except CutError as exc:
+            errors[c.index] = exc.message
+    warnings = _check_pairs(cuts, secs, errors)
+    lays: list[Layout | None] = [None] * len(cuts)
+    for c in cuts:
+        if errors[c.index] is None:
+            try:
+                lays[c.index] = layout(c, secs[c.index], [o for o in cuts if o is not c])
+            except CutError as exc:
+                errors[c.index] = exc.message
+    return Plan(cuts, secs, lays, errors, warnings + _offcut_warnings(cuts, secs, lays))
+
+
+# ---------------------------------------------------------------- preview (2D only)
+def _polys(g, digits: int = 3) -> list[dict]:
+    return [{"exterior": np.round(np.asarray(p.exterior.coords), digits).tolist(),
+             "holes": [np.round(np.asarray(r.coords), digits).tolist() for r in p.interiors]}
+            for p in _polygons(g)]
+
+
+def _crossings(cut: Cut, sec: Section, lay: Layout, cuts: list[Cut]) -> list[dict]:
+    """Where other cuts cross this plane, as 2D lines clipped to the area around the section."""
+    x0, y0, x1, y1 = sec.area.bounds
+    m = lay.W + 40
+    view, out = box(x0 - m, y0 - m, x1 + m, y1 + m), []
+    for o in cuts:
+        nj = cut.plane.R @ o.plane.normal
+        sin = float(np.hypot(nj[0], nj[1]))
+        if o is cut or sin < 1e-6:
+            continue
+        a = nj[:2] / sin
+        mid = a * float(nj @ cut.plane.local(o.plane.origin)) / sin
+        t = np.array([-a[1], a[0]])
+        seg = LineString([mid - 1e4 * t, mid + 1e4 * t]).intersection(view)
+        if seg.geom_type == "LineString" and not seg.is_empty:
+            out.append({"cut": o.index, "line": np.round(np.asarray(seg.coords), 3).tolist()})
+    return out
+
+
+def cut_json(cut: Cut, sec: Section | None, lay: Layout | None, error: str | None, cuts: list[Cut]) -> dict:
+    """Everything the page draws for one cut. A cut with an error has only its frame and the error."""
+    if error or lay is None:
+        return {"frame": cut.plane.as_json(), "error": error or "This cut could not be laid out."}
+    xyz = sec.plane.world(lay.pts) if len(lay.pts) else np.zeros((0, 3))
+    derived = cut.d.as_dict() | {"bolt_line": round(lay.c, 2), "width": round(lay.W, 2), "moved": lay.moved}
+    return {"frame": sec.plane.as_json(), "error": None,
+            "section": _polys(sec.area), "flange": _polys(lay.flange),
+            "bolts": [{"xy": p.round(3).tolist(), "xyz": q.round(3).tolist(), "blocked": i in lay.blocked}
+                      for i, (p, q) in enumerate(zip(lay.pts, xyz))],
+            "bolt_line": [np.round(np.asarray(g.coords), 3).tolist() for g in lay.lines],
+            "free": [np.round(np.asarray(p[0].coords), 3).tolist() for p in lay.pieces],
+            "crossings": _crossings(cut, sec, lay, cuts), "cavities": sec.cavities.round(3).tolist(),
+            "derived": derived, "count": int(len(lay.pts)), "suggested_count": lay.suggested,
+            "warnings": lay.warnings}
+
+
+def preview(model: Model, cuts: list[Cut]) -> dict:
+    """Fast 2D preview of every cut: section, flange outline, bolts, warnings, or the cut's error."""
+    t0 = time.perf_counter()
+    pl = plan(model, cuts)
+    return {"cuts": [cut_json(c, s, l, e, cuts) for c, s, l, e in zip(cuts, pl.secs, pl.lays, pl.errors)],
+            "warnings": pl.warnings, "ms": round(1000 * (time.perf_counter() - t0))}
+
+
+# ---------------------------------------------------------------- generate (3D)
+@dataclass
+class Part:
+    """One printed part: one body of a cell of the cut planes. `matrix` maps world -> print position."""
+
+    name: str
+    solid: Manifold              # world coordinates
+    signature: str               # side of each cut, e.g. "AB"
+    matrix: np.ndarray = field(default_factory=lambda: np.eye(4))
+    down: tuple[int, str] | None = None   # (cut index, side) of the face on the print sheet
+    touches: list[int] = field(default_factory=list)
+    explode: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    mold_fraction: float = 1.0
+    overhang_cm2: float = 0.0
+    bolts: int = 0
+    _stl: bytes | None = None
+
+    def print_solid(self) -> Manifold:
+        return self.solid.transform(self.matrix[:3])
+
+    def stl(self) -> bytes:
+        if self._stl is None:
+            self._stl = stl_bytes(self.print_solid())
+        return self._stl
+
+
+@dataclass
+class Result:
+    plan: Plan
+    parts: list[Part]
+    joins: list[list[tuple[str, str, int]]]      # per cut: (part, part, bolts)
+    warnings: list[dict]
+    seconds: float
+
+    @property
+    def cuts(self) -> list[Cut]:
+        return self.plan.cuts
+
+    @property
+    def secs(self) -> list[Section]:
+        return self.plan.secs
+
+    @property
+    def lays(self) -> list[Layout]:
+        return self.plan.lays
+
+
 def _flange_solid(cut: Cut, lay: Layout) -> Manifold:
     """Flange slab straddling the plane, from -T to +T (POC step 5), in plane coordinates.
 
@@ -611,7 +837,7 @@ def _flange_solid(cut: Cut, lay: Layout) -> Manifold:
     for own, other, z0 in ((lay.flange_a, lay.flange_b, e), (lay.flange_b, lay.flange_a, -T - 1)):
         extra = other.difference(own)
         if extra.area > 1e-3:
-            trim = extra.buffer(0.5).difference(own)
+            trim = _snap(extra.buffer(0.5).difference(own))
             slab -= _shapely_to_cs(trim).extrude(T + 1 - e).translate((0, 0, z0))
     return slab
 
@@ -623,7 +849,7 @@ def _fastening_cutters(cut: Cut, lay: Layout) -> Manifold | None:
     d, T = cut.d, cut.d.thickness
     tools = [Manifold.cylinder(2 * T + 2, d.hole_d / 2, -1, 48, True).translate((x, y, 0.0)) for x, y in lay.pts]
     if d.fastening.nut_pocket:
-        # pocket from the outer face of the chosen part's flange, 1 mm past it for a clean cut;
+        # pocket from the outer face of the chosen side's flange, 1 mm past it for a clean cut;
         # a 6-sided cylinder is a hexagon with circumradius = across flats / sqrt(3)
         h = d.pocket_depth + 1.0
         z0 = T - d.pocket_depth if cut.pocket_half == "A" else -T - 1.0
@@ -632,187 +858,60 @@ def _fastening_cutters(cut: Cut, lay: Layout) -> Manifold | None:
     return Manifold.batch_boolean(tools, OpType.Add)
 
 
-def _check_pairs(model: Model, cuts: list[Cut]) -> list[dict]:
-    """Errors and warnings that involve two cuts."""
-    out = []
-    lo, hi = model.bounds
-    for i, a in enumerate(cuts):
-        for b in cuts[i + 1:]:
-            sin = float(np.linalg.norm(np.cross(a.plane.normal, b.plane.normal)))
-            if sin < PARALLEL_SIN:
-                gap = abs(float(a.plane.normal @ (b.plane.origin - a.plane.origin)))
-                need = a.d.thickness + b.d.thickness + 2.0
-                if gap < need:
-                    raise CutError(f"{a.label} and {b.label} are too close together. Move them at least "
-                                   f"{math.ceil(need)} mm apart.", f"gap {gap:.2f} mm")
-                room = a.d.thickness + b.d.thickness + max(a.d.tool_clearance, b.d.tool_clearance)
-                if gap < room:
-                    out.append(warning("cuts_close", f"{a.label} and {b.label} are only {gap:.0f} mm apart, so "
-                                                     "there may be no room for tools between their flanges.",
-                                       f"Move them at least {math.ceil(room)} mm apart, or lower the tool clearance."))
-            elif math.degrees(math.asin(min(sin, 1.0))) < SHALLOW_DEG and _crossing_in_box(a.plane, b.plane, lo, hi):
-                out.append(warning("shallow_crossing", f"{a.label} and {b.label} cross at a shallow angle "
-                                                       f"({math.degrees(math.asin(sin)):.0f}°).",
-                                   "The flanges merge where the cuts cross. Make the cuts cross at more than 30°."))
-    return out
-
-
-def _crossing_in_box(pa: Plane, pb: Plane, lo: np.ndarray, hi: np.ndarray, margin: float = 20.0) -> bool:
-    """Does the line where two planes meet pass through the model's box (slab test)?"""
-    d = np.cross(pa.normal, pb.normal)
-    p0 = np.linalg.lstsq(np.vstack([pa.normal, pb.normal]), np.array([pa.offset, pb.offset]), rcond=None)[0]
-    t0, t1 = -np.inf, np.inf
-    for k in range(3):
-        if abs(d[k]) < 1e-12:
-            if not lo[k] - margin <= p0[k] <= hi[k] + margin:
-                return False
-            continue
-        ta, tb = sorted(((lo[k] - margin - p0[k]) / d[k], (hi[k] + margin - p0[k]) / d[k]))
-        t0, t1 = max(t0, ta), min(t1, tb)
-    return t0 <= t1
-
-
-def _cross_flange_check(cuts: list[Cut], secs: list[Section], lays: list[Layout]) -> None:
-    """Warn when another cut's flange sits in the space a bolt needs (hole, washer, tool)."""
-    if len(cuts) < 2:
-        return
-    slabs = [_flange_solid(c, l).transform(s.plane.to_world()) for c, s, l in zip(cuts, secs, lays)]
-    for c, s, lay in zip(cuts, secs, lays):
-        if not len(lay.pts):
-            continue
-        reach, r = c.d.thickness + max(c.d.tool_clearance, 1.0), c.d.envelope_r
-        cyl = Manifold.cylinder(2 * reach, r, -1, 32, True)
-        for o, slab in zip(cuts, slabs):
-            if o is c:
-                continue
-            other = slab.transform(s.plane.to_plane())
-            bb = np.asarray(other.bounding_box())
-            hits = [i for i, (x, y) in enumerate(lay.pts)
-                    if bb[0] < x + r and x - r < bb[3] and bb[1] < y + r and y - r < bb[4]
-                    and bb[2] < reach and -reach < bb[5]
-                    and (other ^ cyl.translate((x, y, 0.0))).volume() > BLOCK_VOLUME]
-            if hits:
-                lay.warnings.append(warning(
-                    "flange_in_way", f"{c.label}: the flange of {o.label} is in the way at bolt {_numbers(hits)}.",
-                    "Move the cuts further apart, or use fewer bolts so they stay away from the other cut."))
-
-
-def plan(model: Model, cuts: list[Cut]) -> tuple[list[Section], list[Layout], list[dict]]:
-    """Sections, flange outlines and bolts for all cuts. Shared by preview and generate."""
-    pair_warnings = _check_pairs(model, cuts)
-    secs = [section(model, c) for c in cuts]
-    lays = [layout(c, s, _bands(c, [o for o in cuts if o is not c])) for c, s in zip(cuts, secs)]
-    _cross_flange_check(cuts, secs, lays)
-    return secs, lays, pair_warnings
-
-
-# ---------------------------------------------------------------- preview (2D only)
-def _polys(g, digits: int = 3) -> list[dict]:
-    out = []
-    for poly in getattr(g, "geoms", [g]):
-        if poly.is_empty or poly.geom_type != "Polygon":
-            continue
-        out.append({"exterior": np.round(np.asarray(poly.exterior.coords), digits).tolist(),
-                    "holes": [np.round(np.asarray(r.coords), digits).tolist() for r in poly.interiors]})
-    return out
-
-
-def _cut_json(cut: Cut, sec: Section, lay: Layout) -> dict:
-    x0, y0, x1, y1 = sec.area.bounds
-    m = lay.W + 40
-    view = box(x0 - m, y0 - m, x1 + m, y1 + m)
-    bands = []
-    for b in lay.bands:      # crossing lines, clipped to the area around the section, for drawing
-        t, mid = np.array([-b.a[1], b.a[0]]), b.a * b.c
-        seg = LineString([mid - 1e4 * t, mid + 1e4 * t]).intersection(view)
-        if seg.geom_type == "LineString" and not seg.is_empty:
-            bands.append({"cut": b.other, "line": np.round(np.asarray(seg.coords), 3).tolist(),
-                          "half_width": round(b.half, 2)})
-    xyz = sec.plane.world(lay.pts) if len(lay.pts) else np.zeros((0, 3))
-    derived = cut.d.as_dict() | {"bolt_line": round(lay.c, 2), "width": round(lay.W, 2), "moved": lay.moved}
-    return {"frame": sec.plane.as_json(), "section": _polys(sec.area), "flange": _polys(lay.flange),
-            "bolts": [{"xy": p.round(3).tolist(), "xyz": q.round(3).tolist(), "blocked": i in lay.blocked}
-                      for i, (p, q) in enumerate(zip(lay.pts, xyz))],
-            "bands": bands, "cavity": sec.cavity.round(3).tolist(), "derived": derived,
-            "count": int(len(lay.pts)), "suggested_count": lay.suggested, "warnings": lay.warnings}
-
-
-def preview(model: Model, cuts: list[Cut]) -> dict:
-    """Fast 2D preview of every cut: section, flange outline, bolts, warnings."""
-    t0 = time.perf_counter()
-    secs, lays, pair_warnings = plan(model, cuts)
-    return {"cuts": [_cut_json(c, s, l) for c, s, l in zip(cuts, secs, lays)],
-            "warnings": pair_warnings, "ms": round(1000 * (time.perf_counter() - t0))}
-
-
-# ---------------------------------------------------------------- generate (3D)
-@dataclass
-class Part:
-    """One printed part: a cell of the cut planes. `matrix` maps world -> print position."""
-
-    name: str
-    solid: Manifold              # world coordinates
-    signature: str               # side of each cut, e.g. "AB"
-    matrix: np.ndarray           # 4x4 world -> print (cut face down on the print sheet, z min = 0)
-    down: tuple[int, str] | None # (cut index, side) of the face that lies on the print sheet
-    touches: list[int]           # cuts that have a face on this part
-    explode: np.ndarray
-    bodies: int
-    _stl: bytes | None = None
-
-    def print_solid(self) -> Manifold:
-        return self.solid.transform(self.matrix[:3])
-
-    def stl(self) -> bytes:
-        if self._stl is None:
-            self._stl = stl_bytes(self.print_solid())
-        return self._stl
-
-
-@dataclass
-class Result:
-    cuts: list[Cut]
-    secs: list[Section]
-    lays: list[Layout]
-    parts: list[Part]
-    warnings: list[dict]
-    seconds: float
-
-
 def _part_name(k: int) -> str:
     return chr(65 + k) if k < 26 else chr(64 + k // 26) + chr(65 + k % 26)
 
 
-def _make_part(name: str, solid: Manifold, sig: str, cuts: list[Cut], secs: list[Section],
-               center: np.ndarray) -> Part:
-    mesh = solid.to_mesh()
-    tri = np.asarray(mesh.vert_properties)[:, :3][np.asarray(mesh.tri_verts)]
-    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-    area2 = np.linalg.norm(cross, axis=1)
-    fn = cross / np.maximum(area2, 1e-12)[:, None]
-    faces = []        # (area, cut index, side) of every cut face on this part
-    for i, sec in enumerate(secs):
-        n, side = sec.plane.normal, sig[i]
-        on = np.all(np.abs(tri @ n - sec.plane.offset) < 1e-4, axis=1)
-        outward = -n if side == "A" else n          # a part on side A faces the plane with -normal
-        a = 0.5 * area2[on & (fn @ outward > 0.99)].sum()
-        if a > 1.0:
-            faces.append((a, i, side))
-    touches = sorted(i for _, i, _ in faces)
-    if faces:   # the largest cut face goes down on the print sheet (spec rule 11 for one cut)
-        _, i, side = max(faces)
+def _bodies(cell: Manifold) -> list[Manifold]:
+    """Separate bodies of a cell. Enclosed voids (negative volume) go back into their body."""
+    comps = cell.decompose()
+    if len(comps) == 1:
+        return comps
+    solids = [c for c in comps if c.volume() > 0]
+    for void in (c for c in comps if c.volume() <= 0):
+        vb = np.asarray(void.bounding_box())
+        for k, s in enumerate(solids):
+            sb = np.asarray(s.bounding_box())
+            if np.all(sb[:3] <= vb[:3]) and np.all(vb[3:] <= sb[3:]):
+                solids[k] = Manifold.compose([s, void])
+                break
+    return solids
+
+
+def _orient(part: Part, faces: dict, cuts: list[Cut], secs: list[Section]) -> None:
+    """Choose which cut face goes on the print sheet: the one that leaves the least overhang.
+
+    With one cut there is one candidate, so this is the spec's rule (side A as is, side B turned
+    180 deg about the plane x axis). Ties go to the larger cut face. Also records how much of the
+    other cuts' flanges then hangs in the air (`overhang_cm2`).
+    """
+    if not faces:         # no cut face (a separate body of the original model): keep it as loaded
+        part.matrix[2, 3] -= part.solid.bounding_box()[2]
+        return
+    mesh = part.solid.to_mesh()
+    verts, tris = np.asarray(mesh.vert_properties)[:, :3].astype(float), np.asarray(mesh.tri_verts)
+    world = verts[tris]
+    cross_w = np.cross(world[:, 1] - world[:, 0], world[:, 2] - world[:, 0])
+    a2 = np.linalg.norm(cross_w, axis=1)
+    normal_w, centre_w = cross_w / np.maximum(a2, 1e-12)[:, None], world.mean(axis=1)
+    best = None
+    for i, (area, side, _) in faces.items():
         m = np.vstack([secs[i].plane.to_plane(), [0, 0, 0, 1]])
         m = FLIP @ m if side == "B" else m
-        down = (i, side)
-        explode = sum((1 if s == "A" else -1) * secs[j].plane.normal for _, j, s in faces)
-    else:
-        m, down, explode = np.eye(4), None, np.zeros(3)
-    m[2, 3] -= solid.transform(m[:3]).bounding_box()[2]   # double precision; to_mesh() is float32
-    verts = np.asarray(mesh.vert_properties)[:, :3]
-    if np.linalg.norm(explode) < 1e-6:
-        explode = verts.mean(axis=0) - center
-    explode = explode / max(np.linalg.norm(explode), 1e-9)
-    return Part(name, solid, sig, m, down, touches, explode, len(solid.decompose()))
+        m[2, 3] -= part.solid.transform(m[:3]).bounding_box()[2]   # double precision; to_mesh() is float32
+        z = world @ m[2, :3] + m[2, 3]                               # print height of every corner
+        down = (normal_w @ m[2, :3] < OVERHANG_NZ) & (z.min(axis=1) > 0.1)
+        score = 0.5 * a2[down].sum()
+        if best is None or (score, -area) < best[0]:
+            best = ((score, -area), m, (i, side), down)
+    _, part.matrix, part.down, down = best
+    flange = np.zeros(len(tris), bool)                # faces lying on another cut's flange (slab face or cut face)
+    for j in faces:
+        if j != part.down[0]:
+            s, T = secs[j].plane, cuts[j].d.thickness
+            dist = np.abs(centre_w @ s.normal - s.offset)
+            flange |= (np.abs(normal_w @ s.normal) > 0.99) & ((np.abs(dist - T) < 0.05) | (dist < 0.05))
+    part.overhang_cm2 = 0.5 * a2[down & flange].sum() / 100
 
 
 def generate(model: Model, cuts: list[Cut], progress: Progress | None = None) -> Result:
@@ -820,102 +919,222 @@ def generate(model: Model, cuts: list[Cut], progress: Progress | None = None) ->
     t0 = time.perf_counter()
     step = progress or (lambda stage, fraction: None)
     step("Checking the cuts", 0.05)
-    secs, lays, warnings = plan(model, cuts)
-    step("Adding the flanges", 0.3)
+    pl = plan(model, cuts)
+    pl.raise_errors()
+    secs, lays = pl.secs, pl.lays
+    warnings = list(pl.warnings)
+    step("Adding the flanges", 0.25)
     adds, subs = [model.manifold], []
     for c, s, lay in zip(cuts, secs, lays):
-        to_world = s.plane.to_world()
-        adds.append(_flange_solid(c, lay).transform(to_world))
+        adds.append(_flange_solid(c, lay).transform(s.plane.to_world()))
         tools = _fastening_cutters(c, lay)
         if tools is not None:
-            subs.append(tools.transform(to_world))
+            subs.append(tools.transform(s.plane.to_world()))
     solid = Manifold.batch_boolean(adds, OpType.Add)
-    step("Drilling the bolt holes", 0.5)
+    step("Drilling the bolt holes", 0.45)
     if subs:
         solid = solid - Manifold.batch_boolean(subs, OpType.Add)
-    step("Splitting the parts", 0.7)
-    cells = [(solid, "")]
-    for s in secs:      # split LAST, by every plane in turn
-        nxt = []
-        for m, sig in cells:
-            a, b = m.split_by_plane(tuple(s.plane.normal), s.plane.offset)
-            nxt += [(a, sig + "A"), (b, sig + "B")]
-        cells = [(m, sig) for m, sig in nxt if not m.is_empty() and m.volume() > 1e-3]
-    if len(cells) < 2:
-        raise CutError("The cuts do not divide the model into parts. Move the cut planes into the model.")
-    step("Checking the parts", 0.85)
+    step("Splitting the parts", 0.6)
+    cells, plain = [(solid, "")], [(model.manifold, "")]
+    for s in secs:      # split LAST, by every plane in turn; the plain mold the same way, for comparison
+        cells = [(m, sig + k) for m0, sig in cells
+                 for m, k in zip(m0.split_by_plane(tuple(s.plane.normal), s.plane.offset), "AB")]
+        plain = [(m, sig + k) for m0, sig in plain
+                 for m, k in zip(m0.split_by_plane(tuple(s.plane.normal), s.plane.offset), "AB")]
+    plain_vol = {sig: m.volume() for m, sig in plain}
+    step("Checking the parts", 0.75)
+    found = []
+    for cell, sig in sorted(((m, sig) for m, sig in cells if not m.is_empty()), key=lambda t: t[1]):
+        bodies = _bodies(cell)
+        for body in sorted(bodies, key=lambda b: -b.volume()):
+            vol = body.volume()
+            if vol < 1e-3:
+                continue
+            mold = plain_vol.get(sig, 0.0) / vol if len(bodies) == 1 else \
+                (body ^ next(m for m, s2 in plain if s2 == sig)).volume() / vol
+            if mold < 0.01 and vol < 20_000:
+                warnings.append(warning("offcut_dropped", f"A loose piece of flange ({vol / 1000:.1f} cm³) was "
+                                                          "cut off by another cut and left out.",
+                                        "Move the cuts so they cross inside the wall."))
+                continue
+            found.append(Part("", body, sig, mold_fraction=min(1.0, mold)))
+    if len(found) < 2:
+        raise CutError("The cuts do not divide the model into parts. Move the cuts into the model.")
+    for k, p in enumerate(found):
+        p.name = _part_name(k)
+    all_faces = _cut_faces(found, secs)
+    joins = _connect(found, cuts, lays, all_faces, warnings)
+    step("Placing the parts for printing", 0.85)
     center = model.bounds.mean(axis=0)
-    cells.sort(key=lambda t: t[1])
-    parts = [_make_part(_part_name(k), m, sig, cuts, secs, center) for k, (m, sig) in enumerate(cells)]
-    for p in parts:
-        if p.solid.volume() < SMALL_PART_CM3 * 1000:
-            warnings.append(warning("small_part", f"Part {p.name} is very small "
-                                                  f"({p.solid.volume() / 1000:.2f} cm³).",
-                                    "Check the cut positions. A cut may run along the edge of the model."))
+    for p, faces in zip(found, all_faces):
+        _orient(p, faces, cuts, secs)
+        p.touches = sorted(faces)
+        e = sum((1 if side == "A" else -1) * secs[i].plane.normal for i, (_, side, _) in faces.items()) \
+            if faces else np.zeros(3)
+        if np.linalg.norm(e) < 1e-6:          # e.g. the middle of three slices: move it from the centre
+            e = np.asarray(p.solid.bounding_box()).reshape(2, 3).mean(axis=0) - center
+        n = np.linalg.norm(e)
+        p.explode = e / n if n > 1e-9 else np.zeros(3)
+    _part_warnings(found, cuts, secs, warnings)
     for lay in lays:
         warnings += lay.warnings
     step("Done", 1.0)
-    return Result(cuts, secs, lays, parts, warnings, time.perf_counter() - t0)
+    return Result(pl, found, joins, warnings, time.perf_counter() - t0)
+
+
+def _cut_faces(parts: list[Part], secs: list[Section]) -> list[dict]:
+    """For every part: {cut index: (face area, side, 2D outline)} of the cut faces it has.
+
+    Sliced 0.05 mm off the plane on the part's own side, in that cut's plane coordinates.
+    """
+    out = []
+    for p in parts:
+        faces = {}
+        for i, s in enumerate(secs):
+            side = p.signature[i]
+            g = _cs_to_shapely(p.solid.transform(s.plane.to_plane()).slice(0.05 if side == "A" else -0.05))
+            if g.area > 1.0:
+                faces[i] = (g.area, side, g)
+        out.append(faces)
+    return out
+
+
+def _connect(parts: list[Part], cuts: list[Cut], lays: list, all_faces: list, warnings: list) -> list:
+    """Which parts each cut bolts together, and warnings for parts or joints without bolts."""
+    joins, bolted = [], set()
+    for i, (c, lay) in enumerate(zip(cuts, lays)):
+        side = {"A": {}, "B": {}}
+        for p, faces in zip(parts, all_faces):
+            if i in faces:
+                side[faces[i][1]][p.name] = faces[i][2]
+        count = Counter()
+        for q in lay.pts:
+            disc = Point(q).buffer(c.d.bolt.washer / 2)
+            a = [n for n, g in side["A"].items() if g.intersects(disc)]
+            b = [n for n, g in side["B"].items() if g.intersects(disc)]
+            if a and b:
+                count[(a[0], b[0])] += 1
+        for na, ga in side["A"].items():
+            for nb, gb in side["B"].items():
+                if ga.intersection(gb).area < 1.0:
+                    continue
+                k = count[(na, nb)]
+                if k == 0:
+                    warnings.append(warning("joint_unbolted", f"Parts {na} and {nb} touch along cut {i + 1}, but no "
+                                                              "bolt holds them together.",
+                                            "Move the cuts so this joint is longer, or use more bolts."))
+                elif k == 1:
+                    warnings.append(warning("joint_one_bolt", f"Parts {na} and {nb} are held by only 1 bolt along "
+                                                              f"cut {i + 1}.", "Use more bolts on this cut."))
+        joins.append([(na, nb, k) for (na, nb), k in sorted(count.items())])
+        bolted |= {n for pair in count for n in pair}
+    for p in parts:
+        p.bolts = sum(k for cut_joins in joins for na, nb, k in cut_joins if p.name in (na, nb))
+        if p.name not in bolted:
+            warnings.append(warning("part_unbolted", f"Part {p.name} is not held by any bolt.",
+                                    "Move the cuts: this part would be loose."))
+    return joins
+
+
+def _part_warnings(parts: list[Part], cuts: list[Cut], secs: list, warnings: list) -> None:
+    for p in parts:
+        vol = p.solid.volume() / 1000
+        if vol < SMALL_PART_CM3:
+            warnings.append(warning("small_part", f"Part {p.name} is very small ({vol:.2f} cm³).",
+                                    "Check the cut positions. A cut may run along the edge of the model."))
+        elif p.mold_fraction < MOSTLY_FLANGE:
+            warnings.append(warning("mostly_flange", f"Part {p.name} is mostly flange "
+                                                     f"({100 * p.mold_fraction:.0f}% mold).",
+                                    "Move the cut away from the end of the model."))
+        if p.down is not None and p.overhang_cm2 > 1.0:
+            others = [i for i in p.touches if i != p.down[0]]
+            warnings.append(warning("flange_overhang", f"Part {p.name}: the flange of {_cut_names(others)} "
+                                                       "hangs in the air when printed.",
+                                    "Turn on supports for this part in PrusaSlicer."))
+        try:
+            tm = trimesh.load_mesh(io.BytesIO(p.stl()), file_type="stl")
+            ok = tm.is_watertight
+        except Exception:  # noqa: BLE001 - any failure here means the file needs a look
+            ok = False
+        if not ok:
+            warnings.append(warning("not_watertight", f"Part {p.name} may need a repair in your slicer.",
+                                    "Let PrusaSlicer repair it, or move the cut by 0.1 mm and generate again."))
 
 
 # ---------------------------------------------------------------- report
+def _bolt_spec(c: Cut) -> str:
+    d = c.d
+    return f"{d.bolt.name} × {d.bolt_length} mm" if d.bolt_length else f"{d.bolt.name} × {math.ceil(d.grip + 2)} mm or longer"
+
+
 def hardware(cuts: list[Cut], lays: list[Layout]) -> list[dict]:
-    """Parts list: bolts by size and length, nuts and washers by size."""
+    """Shopping list for all cuts: bolts by size and length, nuts and washers by size."""
     bolts, nuts, washers = Counter(), Counter(), Counter()
     for c, lay in zip(cuts, lays):
-        n, b = len(lay.pts), c.d.bolt.name
-        if not n:
-            continue
-        length = f"{c.d.bolt_length} mm" if c.d.bolt_length else f"{math.ceil(c.d.grip + 2)} mm or longer"
-        bolts[f"{b} × {length}"] += n
-        nuts[b] += n
-        washers[b] += n * c.d.fastening.washers_per_bolt
+        n = len(lay.pts)
+        if n:
+            bolts[_bolt_spec(c)] += n
+            nuts[c.d.bolt.name] += n
+            washers[c.d.bolt.name] += n * c.d.fastening.washers_per_bolt
     return ([{"item": "Bolt", "spec": k, "qty": v} for k, v in sorted(bolts.items())]
             + [{"item": "Nut", "spec": f"{k} (ISO 4032)", "qty": v} for k, v in sorted(nuts.items())]
             + [{"item": "Washer", "spec": f"{k} (ISO 7089)", "qty": v} for k, v in sorted(washers.items())])
 
 
-def cut_report(cut: Cut, lay: Layout) -> dict:
-    d = cut.d
-    return {"cut": cut.index + 1, "side": cut.side, "bolt": d.bolt.name, "fastening": d.fastening.label,
-            "nut_pocket_part_side": cut.pocket_half if d.fastening.nut_pocket else None,
-            "bolts": int(len(lay.pts)), "requested": cut.count if cut.mode == "count" else None,
-            "spacing": cut.spacing if cut.mode == "spacing" else None,
+def cut_report(c: Cut, lay: Layout, joins: list[tuple[str, str, int]]) -> dict:
+    d, n = c.d, len(lay.pts)
+    return {"cut": c.index + 1, "side": c.side, "bolt": d.bolt.name, "fastening": d.fastening.label,
+            "bolts": n, "bolt_spec": _bolt_spec(c), "nuts": n, "washers": n * d.fastening.washers_per_bolt,
+            "nut_pockets_on": c.pocket_half if d.fastening.nut_pocket else None,
             "flange_thickness": round(d.thickness, 2), "flange_width": round(lay.W, 2),
             "bolt_line": round(lay.c, 2), "bolt_line_moved": lay.moved, "hole_diameter": round(d.hole_d, 2),
-            "bolt_length": d.bolt_length, "pocket": ({"across_flats": d.pocket_af, "depth": d.pocket_depth}
-                                                     if d.fastening.nut_pocket else None)}
+            "pocket": ({"across_flats": d.pocket_af, "depth": d.pocket_depth} if d.fastening.nut_pocket else None),
+            "joins": [{"parts": [a, b], "bolts": k} for a, b, k in joins]}
 
 
-def part_report(p: Part, cuts: list[Cut]) -> dict:
-    ps = p.print_solid()
-    bb = np.asarray(ps.bounding_box())
-    sides = ", ".join(f"side {p.signature[i]} of cut {i + 1}" for i in p.touches)
-    return {"name": p.name, "sides": sides, "volume_cm3": round(p.solid.volume() / 1000, 2),
+def part_report(p: Part) -> dict:
+    bb = np.asarray(p.print_solid().bounding_box())
+    return {"name": p.name, "signature": p.signature, "volume_cm3": round(p.solid.volume() / 1000, 2),
             "size": (bb[3:] - bb[:3]).round(1).tolist(), "triangles": int(p.solid.num_tri()),
-            "bodies": p.bodies, "face_down": (f"cut {p.down[0] + 1}" if p.down else None)}
+            "face_down": (p.down[0] + 1 if p.down else None), "cuts": [i + 1 for i in p.touches],
+            "bolts": p.bolts, "overhang_cm2": round(p.overhang_cm2, 1)}
+
+
+def summary(result: Result) -> dict:
+    """JSON-ready description of a result (the server adds the download links)."""
+    pl = result.plan
+    return {"seconds": round(result.seconds, 2),
+            "parts": [part_report(p) | {"to_world": np.linalg.inv(p.matrix).ravel().round(9).tolist(),
+                                         "explode": p.explode.round(6).tolist()} for p in result.parts],
+            "cuts": [cut_report(c, l, j) for c, l, j in zip(pl.cuts, pl.lays, result.joins)],
+            "hardware": hardware(pl.cuts, pl.lays), "warnings": result.warnings,
+            "preview": {"cuts": [cut_json(c, s, l, None, pl.cuts) for c, s, l in zip(pl.cuts, pl.secs, pl.lays)],
+                        "warnings": pl.warnings}}
 
 
 def report_text(result: Result, model_name: str, sha256: str, version: str, files: dict[str, str]) -> str:
     """report.txt for the ZIP: plain text a field user can print."""
     lines = [f"Flange Cutter {version} report", f"Model: {model_name}", f"SHA-256: {sha256}", ""]
-    for c, lay in zip(result.cuts, result.lays):
-        r = cut_report(c, lay)
-        lines += [f"Cut {r['cut']}: {r['bolts']} x {r['bolt']} bolts, {r['fastening'].lower()}, flange {c.side}",
+    for c, lay, joins in zip(result.cuts, result.lays, result.joins):
+        r = cut_report(c, lay, joins)
+        lines += [f"Cut {r['cut']}: {r['bolts']} x {r['bolt_spec']} bolts, {r['nuts']} nuts, {r['washers']} washers "
+                  f"({r['fastening'].lower()}, flange on the {c.side})",
+                  f"  joins: " + (", ".join(f"{j['parts'][0]}-{j['parts'][1]} ({j['bolts']} bolts)"
+                                            for j in r["joins"]) or "nothing"),
                   f"  flange {r['flange_thickness']} mm thick per part, {r['flange_width']} mm wide; "
                   f"bolt line {r['bolt_line']} mm from the wall; holes {r['hole_diameter']} mm",
                   f"  plane origin {np.round(c.plane.origin, 2).tolist()}, normal {np.round(c.plane.normal, 4).tolist()}"]
         if r["pocket"]:
-            lines.append(f"  nut pockets in the side-{c.pocket_half} part: {r['pocket']['across_flats']:.1f} mm "
-                         f"across flats, {r['pocket']['depth']:.1f} mm deep")
-    lines += ["", "Parts (print each one as it is in its file: cut face down, no supports for the flange):"]
+            lines.append(f"  nut pockets on side {c.pocket_half}: {r['pocket']['across_flats']:.1f} mm across flats, "
+                         f"{r['pocket']['depth']:.1f} mm deep")
+    lines += ["", "Parts (print each as it lies in its file: the cut face on the print sheet):"]
     for p in result.parts:
-        r = part_report(p, result.cuts)
+        r = part_report(p)
+        down = f"cut {r['face_down']} face down" if r["face_down"] else "as loaded"
         lines.append(f"  Part {p.name}: {files.get(p.name, '')}  {r['volume_cm3']} cm³, "
-                     f"{' x '.join(f'{v:g}' for v in r['size'])} mm, {r['sides']}"
-                     + (f", {r['bodies']} separate pieces" if r["bodies"] > 1 else ""))
-    lines += ["", "Hardware:"] + [f"  {h['qty']} x {h['item'].lower()} {h['spec']}"
-                                   for h in hardware(result.cuts, result.lays)]
+                     f"{' x '.join(f'{v:g}' for v in r['size'])} mm, {down}, {r['bolts']} bolts")
+    lines += ["", "Hardware (all cuts):"] + [f"  {h['qty']} x {h['item'].lower()} {h['spec']}"
+                                              for h in hardware(result.cuts, result.lays)]
     if result.warnings:
         lines += ["", "Warnings:"] + [f"  - {w['message']} {w['action']}" for w in result.warnings]
     return "\n".join(lines) + "\n"
