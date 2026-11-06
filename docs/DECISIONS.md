@@ -15,7 +15,7 @@ assembly, simplicity) found a concrete failing case.
 | 4 | The repository stays local; the owner pushes it and checks the first GitHub workflow run (owner). | Pushing is the owner's call. The workflow runs the same `build/build_windows.ps1` that was tested locally. |
 | 5 | The user manual gives no material or print-sheet advice (owner, overrides spec §9). | Owner's choice; print orientation and supports are still covered. |
 | 6 | Development Python 3.12.10 and Inno Setup 6.7.3 installed per user with `winget --scope user`. | The development laptop has no admin rights, like the field laptops. |
-| 7 | Code size: the Python is above the spec's "about 1,500 lines" (the geometry alone is about 1,500), and the JavaScript is about 1,480 lines instead of about 1,200. | Multi-cut (decision 1) roughly doubles the geometry and adds the cut list, per-cut status and cut placement to the page; the owner accepted this when choosing it. |
+| 7 | Code size: the Python is about 1,900 lines instead of "about 1,500" (the geometry alone is about 1,500), and the JavaScript about 1,600 (1,480 without blank lines) instead of about 1,200. | Multi-cut (decision 1) roughly doubles the geometry and adds the cut list, per-cut status and cut placement to the page; the owner accepted this when choosing it. |
 
 ## Geometry (one cut)
 
