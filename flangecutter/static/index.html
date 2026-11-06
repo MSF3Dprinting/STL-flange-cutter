@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flange Cutter</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three/build/three.module.js",
+    "three/addons/": "/static/vendor/three/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+<main id="app">
+  <section id="view3d" aria-label="3D view">
+    <div class="tools">
+      <button id="fit-view" type="button" title="Show the whole model">Fit view</button>
+      <label class="tool-check" title="Make the model transparent, to see the cuts inside it">
+        <input type="checkbox" id="see-through"> See-through</label>
+      <button id="show-parts" type="button" hidden>Show parts</button>
+      <span id="result-tools" class="tool-group" hidden>
+        <label for="explode">Explode</label>
+        <input type="range" id="explode" min="0" max="100" value="0" title="Move the parts apart">
+        <button id="back-to-edit" type="button">Back to editing</button>
+      </span>
+    </div>
+    <div id="empty-hint" class="empty-hint">Click <b>Open STL</b> on the right, or drag an STL file here.</div>
+    <div id="drop-hint" class="drop-hint" hidden>Drop the STL file to open it</div>
+    <p class="view-help">Drag: turn &middot; Right-drag: pan &middot; Wheel: zoom &middot; Click a cut to select it
+      &middot; Shift+click the model: move the selected cut there</p>
+  </section>
+
+  <aside id="side">
+    <div id="steps">
+      <section class="step" id="step-model">
+        <h2><span class="num">1</span>Model</h2>
+        <div class="row">
+          <button id="open-btn" type="button" class="primary">Open STL</button>
+          <input type="file" id="file-input" accept=".stl" hidden>
+          <span id="m-name" class="m-name"></span>
+        </div>
+        <p id="model-info" class="facts" hidden><span id="m-size"></span> &middot; <span id="m-tris"></span> triangles
+          &middot; <span id="m-check"></span></p>
+        <ul id="model-warnings" class="warnings"></ul>
+      </section>
+
+      <fieldset class="step" id="step-cuts" disabled>
+        <legend><span class="num">2</span>Cuts</legend>
+        <ul id="cut-list" class="cut-list"></ul>
+        <ul id="cut-notes" class="warnings"></ul>
+        <div class="row">
+          <button id="add-cut" type="button" title="A new cut with the settings of the selected cut">Add cut</button>
+          <button id="delete-cut" type="button">Delete cut</button>
+        </div>
+        <h3 id="sel-title" class="for-cut">Selected cut</h3>
+        <div class="row">
+          <div class="seg" title="Keys W and E">
+            <label class="on"><input type="radio" name="mode" value="translate" checked>Move (W)</label>
+            <label><input type="radio" name="mode" value="rotate">Rotate (E)</label>
+          </div>
+          <label class="check" title="Move in 1 mm steps and turn in 5° steps">
+            <input type="checkbox" id="snap"> Snap 1 mm, 5°</label>
+        </div>
+        <div class="row wrap">
+          <button type="button" data-preset="x" title="Cut across the X axis, through the model center">Across X</button>
+          <button type="button" data-preset="y" title="Cut across the Y axis, through the model center">Across Y</button>
+          <button type="button" data-preset="z" title="Cut across the Z axis, through the model center">Across Z</button>
+          <button type="button" data-preset="center" title="Move the cut through the model center">Center on model</button>
+          <button type="button" data-preset="reset" title="Put the cut back where it started">Reset</button>
+        </div>
+        <div class="xyz" title="Position of the cut (its gizmo) in millimeters. Arrow keys: 1 mm steps.">
+          <span class="xyz-label">Position (mm)</span>
+          <label>X <input type="text" inputmode="decimal" autocomplete="off" class="number" id="pos-x" data-step="1"></label>
+          <label>Y <input type="text" inputmode="decimal" autocomplete="off" class="number" id="pos-y" data-step="1"></label>
+          <label>Z <input type="text" inputmode="decimal" autocomplete="off" class="number" id="pos-z" data-step="1"></label>
+        </div>
+        <div class="xyz" title="Rotation of the cut about the X, Y and Z axes, in degrees. Arrow keys: 5° steps.">
+          <span class="xyz-label">Rotation (°)</span>
+          <label>X <input type="text" inputmode="decimal" autocomplete="off" class="number" id="rot-x" data-step="5"></label>
+          <label>Y <input type="text" inputmode="decimal" autocomplete="off" class="number" id="rot-y" data-step="5"></label>
+          <label>Z <input type="text" inputmode="decimal" autocomplete="off" class="number" id="rot-z" data-step="5"></label>
+        </div>
+        <div class="slider" title="Move the cut along its arrow. 0 = through the model center.">
+          <label for="shift">Shift along normal</label>
+          <input type="range" id="shift" step="0.5">
+          <output id="shift-out" for="shift"></output>
+        </div>
+      </fieldset>
+
+      <fieldset class="step" id="step-side" disabled>
+        <legend><span class="num">3</span>Flange side<span class="for-cut"></span></legend>
+        <div class="seg">
+          <label title="The flange grows from the outer face of the wall"><input type="radio" name="side" value="outside">Outside</label>
+          <label title="The flange grows from the inner face of the wall"><input type="radio" name="side" value="inside">Inside</label>
+        </div>
+        <p class="note">The mold face on the other side stays clean.</p>
+      </fieldset>
+
+      <fieldset class="step" id="step-bolts" disabled>
+        <legend><span class="num">4</span>Bolts and flange<span class="for-cut"></span></legend>
+        <div class="choice">
+          <span class="label">Bolt size</span>
+          <div class="seg" id="bolt-sizes"></div>
+        </div>
+        <div class="choice">
+          <span class="label">Bolts</span>
+          <div class="seg">
+            <label title="Choose how many bolts this cut gets"><input type="radio" name="dist" value="count">Number of bolts</label>
+            <label title="Choose the distance between bolts"><input type="radio" name="dist" value="spacing">Spacing</label>
+          </div>
+        </div>
+        <div class="field" id="count-field" title="How many bolts this cut gets, spread evenly along the flange.">
+          <label for="count">Number of bolts<span class="range" id="count-range"></span></label>
+          <input type="text" inputmode="numeric" autocomplete="off" class="number" id="count" data-step="1">
+          <button type="button" id="suggest" title="About one bolt every 50 mm">Suggest</button>
+        </div>
+        <div class="field" id="spacing-field" title="Distance between bolts along the flange." hidden>
+          <label for="spacing">Spacing<span class="range" id="spacing-range"></span></label>
+          <input type="text" inputmode="decimal" autocomplete="off" class="number" id="spacing" data-step="5">
+          <span class="unit">mm</span>
+        </div>
+        <div class="choice">
+          <span class="label">Fastening</span>
+          <div class="seg" id="fastenings"></div>
+        </div>
+        <div class="choice" id="pocket-field" hidden>
+          <span class="label">Nut pockets on</span>
+          <div class="seg">
+            <label title="The part on the side the arrow points to"><input type="radio" name="pocket" value="A">Arrow side</label>
+            <label title="The part on the other side"><input type="radio" name="pocket" value="B">Other side</label>
+          </div>
+        </div>
+        <div id="main-params"></div>
+        <details id="advanced">
+          <summary>Advanced</summary>
+          <div id="adv-params"></div>
+        </details>
+        <div class="row wrap">
+          <button type="button" id="reset-defaults">Reset to defaults</button>
+          <button type="button" id="apply-all">Use these settings for all cuts</button>
+        </div>
+      </fieldset>
+
+      <fieldset class="step" id="step-generate" disabled>
+        <legend><span class="num">5</span>Generate and export</legend>
+        <button type="button" id="generate" class="primary big">Generate</button>
+        <p id="generate-why" class="why"></p>
+        <div id="progress" hidden>
+          <span id="progress-stage"></span>
+          <progress id="progress-bar" max="1" value="0"></progress>
+        </div>
+        <h3>Warnings</h3>
+        <p id="no-warnings" class="muted">No warnings.</p>
+        <ul id="warnings" class="warnings"></ul>
+        <div id="results" hidden>
+          <h3>Parts</h3>
+          <table class="table">
+            <thead><tr><th>Part</th><th>Size</th><th>On the print sheet</th><th>Bolts</th></tr></thead>
+            <tbody id="parts-body"></tbody>
+          </table>
+          <h3>Hardware</h3>
+          <table class="table"><tbody id="hardware-body"></tbody></table>
+          <ul id="joins" class="joins"></ul>
+          <div id="downloads" class="row wrap"></div>
+        </div>
+        <div class="row wrap">
+          <button type="button" id="save-settings" title="Save all cuts to a file, to use them again later">Save settings</button>
+          <button type="button" id="load-settings" title="Open a settings file saved earlier">Load settings</button>
+          <input type="file" id="settings-input" accept=".json,application/json" hidden>
+        </div>
+      </fieldset>
+    </div>
+
+    <section id="cutview" aria-label="2D cut view">
+      <h2 id="cutview-title">2D cut view</h2>
+      <p id="cutview-msg"></p>
+      <svg id="cutview-svg" role="img" aria-label="Drawing of the selected cut"></svg>
+      <p class="legend"><span class="key section"></span>Wall <span class="key flange"></span>Flange
+        <span class="key hole"></span>Bolt hole <span class="key washer"></span>Washer
+        <span class="key boltline"></span>Bolt line
+        <span id="key-noroom" title="Another cut is too close here" hidden><span class="key noroom"></span>No room for bolts</span>
+        <span id="key-blocked" title="The wall is in the way of a tool for this bolt" hidden><span class="key blocked"></span>Blocked bolt</span></p>
+    </section>
+  </aside>
+</main>
+<footer id="statusbar">
+  <span class="app-name">Flange Cutter <span id="version"></span></span>
+  <span id="status-text" role="status" aria-live="polite">Starting...</span>
+  <button id="quit" type="button" title="Stop Flange Cutter">Quit</button>
+</footer>
+</body>
+</html>
