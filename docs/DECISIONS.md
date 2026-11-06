@@ -15,7 +15,7 @@ assembly, simplicity) found a concrete failing case.
 | 4 | The repository stays local; the owner pushes it and checks the first GitHub workflow run (owner). | Pushing is the owner's call. The workflow runs the same `build/build_windows.ps1` that was tested locally. |
 | 5 | The user manual gives no material or print-sheet advice (owner, overrides spec §9). | Owner's choice; print orientation and supports are still covered. |
 | 6 | Development Python 3.12.10 and Inno Setup 6.7.3 installed per user with `winget --scope user`. | The development laptop has no admin rights, like the field laptops. |
-| 7 | Code size: the Python is above the spec's "about 1,500 lines" (the geometry alone is about 1,500). | Multi-cut (decision 1) roughly doubles the geometry; the owner accepted this when choosing it. |
+| 7 | Code size: the Python is above the spec's "about 1,500 lines" (the geometry alone is about 1,500), and the JavaScript is about 1,480 lines instead of about 1,200. | Multi-cut (decision 1) roughly doubles the geometry and adds the cut list, per-cut status and cut placement to the page; the owner accepted this when choosing it. |
 
 ## Geometry (one cut)
 
@@ -45,3 +45,26 @@ assembly, simplicity) found a concrete failing case.
 | 24 | After Generate: loose flange offcuts (no mold inside) are left out with a warning; parts that are mostly flange, parts or joints held by no bolt or only one bolt, flanges that print in mid-air, and parts that are not watertight after export each give a warning. The report lists which parts each cut bolts together (review). | Infinite planes can cut off pieces nobody asked for; the user must see it before printing. |
 | 25 | Print orientation: of the cut faces a part has, the one that leaves the **least overhang** goes on the print sheet (ties: the larger face), oriented by the spec's rule for that cut (side A as is, side B turned 180° about the plane x axis) (review). | "Largest face down" printed cross-cut quarters as arches with the cavity overhanging; with one cut there is only one candidate, so the spec's rule is unchanged. |
 | 26 | Not done in version 1 (review suggestions): cuts limited to one side of another cut (T-junctions), hexagon rotation for pockets printed sideways, printer bed-size checks. | Kept the app small; listed as ideas in the README. |
+
+## The page
+
+| # | Decision | Why |
+|---|---|---|
+| 27 | The first cut goes across the longest side, through the middle of the model's box; if that plane misses the model (two cups side by side), across the next longest side. | Long molds are mostly cut to fit the printer. |
+| 28 | **Add cut** copies the selected cut's settings onto a plane turned 90° (or parallel, a quarter of the model away), choosing one that crosses the model and does not lie on another cut. | The first version stacked new cuts on old ones (review). |
+| 29 | **Across X/Y/Z** keep the model's +Z up in the 2D view. **Reset** returns a cut to the plane it started with. Number fields accept a decimal comma. | Predictable views; field users often type commas. |
+| 30 | The model is tinted by part before Generate (which side of every cut each point is on). | Users see the parts a cut layout makes while they move the cuts. |
+| 31 | Any real change after Generate drops the parts and says "Click Generate to make new parts"; a click on a handle without moving it does not. | Downloads must always match what is shown (review). |
+| 32 | **Quit**, **Delete cut** and **Use these settings for all cuts** ask for confirmation. | One misclick must not lose work (review). |
+| 33 | The server takes a new free port at every start. When it is gone, the page says to start it again and that it opens a new tab. | Spec: "a free port"; a fixed port can be taken by another program. |
+| 34 | The UI test writes the manual's screenshots only with `FLANGECUTTER_SHOTS=1`. | A normal test run must not change files in git (review). |
+
+## Packaging
+
+| # | Decision | Why |
+|---|---|---|
+| 35 | The installer always installs per user to `%LOCALAPPDATA%\Programs\FlangeCutter` and does not offer another folder or an admin mode. | Spec: never an admin prompt; one known place makes support easier. |
+| 36 | Setup and the uninstaller ask a running Flange Cutter to quit through `/api/shutdown` (port from the lock file) and fall back to Windows Restart Manager. Uninstall keeps `%LOCALAPPDATA%\FlangeCutter`. | Upgrades while the app runs must work; user settings survive. |
+| 37 | Windows 10 or later, x64 (`x64compatible`). The exe carries version information and a generated icon (`build/make_icon.py`). | The libraries are 64-bit; version information helps antivirus tools and support. |
+| 38 | `build_windows.ps1` smoke-tests the built exe (start, page, quit) before zipping, and signs before packaging, so the shipped exe is the tested one. Signing in CI only through repository secrets. | A broken or unsigned-by-mistake package must never ship. |
+| 39 | The launcher looks for a running app before it loads numpy, trimesh and manifold3d. | A second double-click answers in about 0.5 s instead of several seconds. |
