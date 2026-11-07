@@ -569,8 +569,8 @@ export class Viewer {
   listenForClicks() {
     const canvas = this.renderer.domElement;
     let down = null;
-    canvas.addEventListener('pointerdown', (e) => {
-      down = { x: e.clientX, y: e.clientY, gizmo: this.gizmo.dragging };   // the gizmo handled it first
+    canvas.addEventListener('pointerdown', (e) => {              // the gizmo saw this press first
+      down = { x: e.clientX, y: e.clientY, gizmo: this.gizmo.dragging || this.gizmo.axis !== null };
     });
     canvas.addEventListener('pointerup', (e) => {
       const click = down && !down.gizmo && e.button === 0 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5;
@@ -585,8 +585,31 @@ export class Viewer {
         return;
       }
       const targets = [...this.cuts.values()].flatMap((c) => [c.fill, c.label]);
-      const hit = this.raycaster.intersectObjects(targets)[0];
-      if (hit) this.events.select(hit.object.userData.cutId);
+      const hits = this.raycaster.intersectObjects(targets);
+      if (!hits.length) return;
+      // A number badge is drawn on top of everything: a click on one selects that cut.
+      const badge = hits.find((h) => h.object.isSprite);
+      if (badge) {
+        this.events.select(badge.object.userData.cutId);
+        return;
+      }
+      // Cuts cross each other, often at the model center right under the gizmo. Near the gizmo, or
+      // where the selected plane is hit next to the first plane, the selected cut stays selected, so a
+      // slightly missed handle never switches cuts. Anywhere else the plane in front is selected.
+      const own = hits.find((h) => h.object.userData.cutId === this.selected);
+      if (own && (own === hits[0] || this.nearGizmo(e.clientX, e.clientY)
+                  || own.point.distanceTo(hits[0].point) < 0.02 * this.size)) return;
+      this.events.select(hits[0].object.userData.cutId);
     });
+  }
+
+  /** True when a page point lies within the selected cut's gizmo: its handles reach about this far. */
+  nearGizmo(x, y) {
+    const c = this.cuts.get(this.selected);
+    if (!c) return false;
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const p = c.obj.getWorldPosition(new THREE.Vector3()).project(this.camera);
+    const gx = r.left + (p.x + 1) / 2 * r.width, gy = r.top + (1 - p.y) / 2 * r.height;
+    return Math.hypot(x - gx, y - gy) < 0.12 * Math.min(r.width, r.height);
   }
 }

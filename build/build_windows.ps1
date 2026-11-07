@@ -1,23 +1,21 @@
 <#
 .SYNOPSIS
-    Builds the Windows packages of Flange Cutter: the per-user installer and the portable ZIP.
+    Builds the Windows package of Flange Cutter: the portable ZIP (no installer).
 
 .DESCRIPTION
     1. PyInstaller one-folder build:  build\out\dist\FlangeCutter\FlangeCutter.exe (+ _internal\)
     2. Code signing of FlangeCutter.exe (only with a certificate)
-    3. Smoke test: starts the built app on 127.0.0.1, checks /api/ping and the page, quits it
-    4. Portable ZIP:  build\out\FlangeCutter-<version>-portable.zip  (a FlangeCutter\ folder inside)
-    5. Installer:     build\out\FlangeCutter-Setup-<version>.exe     (Inno Setup; signed too)
+    3. Portable ZIP:  build\out\FlangeCutter-<version>-portable.zip  (a FlangeCutter\ folder inside)
+    4. Smoke test of the ZIP: unzips it into build\out\zip-test, starts that FlangeCutter.exe on
+       127.0.0.1, checks /api/ping and the page, quits it. So the test runs exactly what users unzip.
 
+    Users unzip the ZIP by hand and double-click FlangeCutter.exe; nothing is installed.
     The version comes from flangecutter\__init__.py. Runs in Windows PowerShell 5.1 and PowerShell 7,
     needs no admin rights, and stops with a message and exit code 1 at the first failure.
 
 .PARAMETER Python
     python.exe with requirements.txt and requirements-dev.txt installed (Python 3.12).
     Default: .venv\Scripts\python.exe in the project folder, else python.exe from PATH.
-
-.PARAMETER InnoSetupCompiler
-    Path of ISCC.exe. Default: PATH, then the usual Inno Setup 6 folders (per user and per machine).
 
 .PARAMETER CertificateFile
     Code signing certificate as a .pfx file. Without -CertificateFile or -CertificateThumbprint
@@ -49,7 +47,6 @@
 [CmdletBinding()]
 param(
     [string]$Python = "",
-    [string]$InnoSetupCompiler = "",
     [string]$CertificateFile = "",
     [object]$CertificatePassword = $null,
     [string]$CertificateThumbprint = "",
@@ -74,6 +71,7 @@ $Out = Join-Path $Root "build\out"
 $Dist = Join-Path $Out "dist"
 $AppDir = Join-Path $Dist "FlangeCutter"
 $Exe = Join-Path $AppDir "FlangeCutter.exe"
+$ZipTest = Join-Path $Out "zip-test"
 $Clock = [Diagnostics.Stopwatch]::StartNew()
 
 function Write-Step([string]$Text) {
@@ -121,9 +119,8 @@ Write-Step "Checking the tools"
 $init = Get-Content -LiteralPath (Join-Path $Root "flangecutter\__init__.py") -Raw -Encoding UTF8
 if ($init -notmatch '(?m)^__version__\s*=\s*"([^"]+)"') { throw "No __version__ found in flangecutter\__init__.py." }
 $Version = $Matches[1]
-if ($Version -notmatch '^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?') { throw "Version '$Version' must start with numbers, like 1.2.0." }
-$NumericVersion = (1..4 | ForEach-Object { if ($Matches[$_]) { [int]$Matches[$_] } else { 0 } }) -join "."
-Write-Host "    Flange Cutter $Version (file version $NumericVersion)"
+if ($Version -notmatch '^\d+(\.\d+){0,3}') { throw "Version '$Version' must start with numbers, like 1.2.0." }
+Write-Host "    Flange Cutter $Version"
 # Windows limits most paths to 260 characters, and the build writes files up to ~120 characters deep.
 if ($Root.Length -gt 135) {
     Write-Warning ("The project folder path is $($Root.Length) characters long. If the build fails with " +
@@ -145,14 +142,6 @@ if ((Get-ProgramOutput $Python @("-c", $check)) -ne "ok") {
     throw ("Python packages are missing. Install them with:`n    `"$Python`" -m pip install " +
            "-r `"$(Join-Path $Root 'requirements.txt')`" -r `"$(Join-Path $Root 'requirements-dev.txt')`"")
 }
-
-$innoPlaces = @()
-foreach ($base in @((Join-Path $env:LOCALAPPDATA "Programs"), ${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
-    if ($base) { $innoPlaces += Join-Path $base "Inno Setup 6\ISCC.exe" }
-}
-$Iscc = Find-Tool $InnoSetupCompiler "ISCC.exe" $innoPlaces ("Install Inno Setup 6 (no admin rights needed: " +
-        "winget install JRSoftware.InnoSetup --scope user) or pass -InnoSetupCompiler <path of ISCC.exe>.")
-Write-Host "    Inno Setup  $Iscc"
 
 # Code signing: optional. $SignArguments are the signtool.exe arguments without the file name.
 $Signing = [bool]($CertificateFile -or $CertificateThumbprint)
@@ -190,16 +179,11 @@ if ($Signing) {
     Write-Host "    Signing     skipped: no certificate given (-CertificateFile or -CertificateThumbprint)." -ForegroundColor Yellow
 }
 
-function Invoke-Signing([string]$File) {
-    Invoke-Program "Signing $File" $SignTool ($SignArguments + @($File))
-}
-
 # --------------------------------------------------------------------------------------------
 Write-Step "Cleaning build\out"
 
 $Zip = Join-Path $Out "FlangeCutter-$Version-portable.zip"
-$Setup = Join-Path $Out "FlangeCutter-Setup-$Version.exe"
-foreach ($old in @($Dist, (Join-Path $Out "work"), (Join-Path $Out "smoke-home"), $Zip, $Setup)) {
+foreach ($old in @($Dist, (Join-Path $Out "work"), (Join-Path $Out "smoke-home"), $ZipTest, $Zip)) {
     if (Test-Path -LiteralPath $old) {
         try { Remove-Item -LiteralPath $old -Recurse -Force }
         catch { throw "Cannot delete $old. Is Flange Cutter from an earlier build still running? ($($_.Exception.Message))" }
@@ -220,57 +204,10 @@ $files = Get-ChildItem -LiteralPath $AppDir -Recurse -File
 Write-Host ("    {0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB))
 
 # --------------------------------------------------------------------------------------------
-# Signed before the smoke test, so the test starts exactly the EXE that ships.
+# Signed before zipping, so the ZIP carries the signed EXE that the smoke test then starts.
 if ($Signing) {
     Write-Step "Signing FlangeCutter.exe"
-    Invoke-Signing $Exe
-}
-
-# --------------------------------------------------------------------------------------------
-if ($SkipSmokeTest) {
-    Write-Step "Smoke test skipped (-SkipSmokeTest)"
-} else {
-    Write-Step "Smoke test: start the built app, check it, quit it"
-
-    # The app keeps its lock file and log in a scratch folder here, never in the user's own folder.
-    $smokeHome = Join-Path $Out "smoke-home"
-    New-Item -ItemType Directory -Force -Path $smokeHome | Out-Null
-    $savedHome = $env:FLANGECUTTER_HOME
-    $env:FLANGECUTTER_HOME = $smokeHome
-    $process = $null
-    try {
-        $started = [Diagnostics.Stopwatch]::StartNew()
-        $process = Start-Process -FilePath $Exe -ArgumentList "--no-browser" -WindowStyle Hidden -PassThru
-        $null = $process.Handle          # keeps the exit code readable in Windows PowerShell 5.1
-        $lock = Join-Path $smokeHome "flangecutter.lock"
-        $port = 0
-        while (-not $port) {
-            if ($process.HasExited) { throw "The built app stopped at start (exit code $($process.ExitCode)). Log: $smokeHome\logs" }
-            if ($started.Elapsed.TotalSeconds -gt 120) { throw "The built app did not start within 120 s." }
-            Start-Sleep -Milliseconds 200
-            try { $port = [int](Get-Content -LiteralPath $lock -Raw -ErrorAction Stop | ConvertFrom-Json).port } catch { $port = 0 }
-        }
-        $web = New-Object System.Net.WebClient
-        $web.Proxy = $null               # straight to 127.0.0.1, never through a proxy
-        $web.Encoding = [System.Text.Encoding]::UTF8
-        $url = "http://127.0.0.1:$port"
-        $ping = $web.DownloadString("$url/api/ping") | ConvertFrom-Json
-        if ($ping.app -ne "flangecutter" -or $ping.version -ne $Version) { throw "Unexpected /api/ping answer: $($ping | ConvertTo-Json -Compress)" }
-        Write-Host ("    started in {0:N1} s on port {1}" -f $started.Elapsed.TotalSeconds, $port)
-        if ($web.DownloadString("$url/") -notmatch "<html") { throw "The built app does not serve its page at /." }
-        $bolts = $web.DownloadString("$url/api/bolts") | ConvertFrom-Json
-        Write-Host "    page OK, bolt sizes: $(($bolts.bolts | ForEach-Object { $_.name }) -join ', ')"
-        $web.Headers.Add("Content-Type", "application/json")
-        $null = $web.UploadString("$url/api/shutdown", "POST", "{}")
-        if (-not $process.WaitForExit(20000)) { throw "The built app did not quit after /api/shutdown." }
-        if ($process.ExitCode -ne 0) { throw "The built app quit with exit code $($process.ExitCode). Log: $smokeHome\logs" }
-        if (Test-Path -LiteralPath $lock) { throw "The built app left its lock file behind." }
-        Write-Host "    quit OK"
-    } finally {
-        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
-        $env:FLANGECUTTER_HOME = $savedHome
-    }
-    Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
+    Invoke-Program "Signing $Exe" $SignTool ($SignArguments + @($Exe))
 }
 
 # --------------------------------------------------------------------------------------------
@@ -293,34 +230,68 @@ try {
 }
 
 # --------------------------------------------------------------------------------------------
-Write-Step "Inno Setup: per-user installer"
+if ($SkipSmokeTest) {
+    Write-Step "Smoke test skipped (-SkipSmokeTest)"
+} else {
+    Write-Step "Smoke test: unzip the ZIP, start that FlangeCutter.exe, check it, quit it"
 
-$isccArguments = @("/Q", "/DAppVersion=$Version", "/DAppNumericVersion=$NumericVersion",
-                   "/DDistDir=$AppDir", "/DOutputDir=$Out")
-if ($Signing) {
-    # Inno Setup runs signtool itself, for the uninstaller and for Setup. In this command $q stands
-    # for a double quote, $$ for $, and $f for the file to sign.
-    $command = (@($SignTool) + $SignArguments | ForEach-Object { '$q' + $_.Replace('$', '$$') + '$q' }) -join " "
-    $isccArguments += @("/DSign", ("/Sflangesign=" + $command + ' $f'))
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $ZipTest)
+    $testExe = Join-Path $ZipTest "FlangeCutter\FlangeCutter.exe"
+    if (-not (Test-Path -LiteralPath $testExe)) { throw "The ZIP has no FlangeCutter\FlangeCutter.exe." }
+
+    # The app keeps its lock file and log in a scratch folder here, never in the user's own folder.
+    $smokeHome = Join-Path $Out "smoke-home"
+    New-Item -ItemType Directory -Force -Path $smokeHome | Out-Null
+    $savedHome = $env:FLANGECUTTER_HOME
+    $env:FLANGECUTTER_HOME = $smokeHome
+    $process = $null
+    try {
+        $started = [Diagnostics.Stopwatch]::StartNew()
+        $process = Start-Process -FilePath $testExe -ArgumentList "--no-browser" -WindowStyle Hidden -PassThru
+        $null = $process.Handle          # keeps the exit code readable in Windows PowerShell 5.1
+        $lock = Join-Path $smokeHome "flangecutter.lock"
+        $port = 0
+        while (-not $port) {
+            if ($process.HasExited) { throw "The unzipped app stopped at start (exit code $($process.ExitCode)). Log: $smokeHome\logs" }
+            if ($started.Elapsed.TotalSeconds -gt 120) { throw "The unzipped app did not start within 120 s." }
+            Start-Sleep -Milliseconds 200
+            try { $port = [int](Get-Content -LiteralPath $lock -Raw -ErrorAction Stop | ConvertFrom-Json).port } catch { $port = 0 }
+        }
+        $web = New-Object System.Net.WebClient
+        $web.Proxy = $null               # straight to 127.0.0.1, never through a proxy
+        $web.Encoding = [System.Text.Encoding]::UTF8
+        $url = "http://127.0.0.1:$port"
+        $ping = $web.DownloadString("$url/api/ping") | ConvertFrom-Json
+        if ($ping.app -ne "flangecutter" -or $ping.version -ne $Version) { throw "Unexpected /api/ping answer: $($ping | ConvertTo-Json -Compress)" }
+        Write-Host ("    started in {0:N1} s on port {1}" -f $started.Elapsed.TotalSeconds, $port)
+        if ($web.DownloadString("$url/") -notmatch "<html") { throw "The unzipped app does not serve its page at /." }
+        $bolts = $web.DownloadString("$url/api/bolts") | ConvertFrom-Json
+        Write-Host "    page OK, bolt sizes: $(($bolts.bolts | ForEach-Object { $_.name }) -join ', ')"
+        $web.Headers.Add("Content-Type", "application/json")
+        $null = $web.UploadString("$url/api/shutdown", "POST", "{}")
+        if (-not $process.WaitForExit(20000)) { throw "The unzipped app did not quit after /api/shutdown." }
+        if ($process.ExitCode -ne 0) { throw "The unzipped app quit with exit code $($process.ExitCode). Log: $smokeHome\logs" }
+        if (Test-Path -LiteralPath $lock) { throw "The unzipped app left its lock file behind." }
+        Write-Host "    quit OK"
+    } finally {
+        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        $env:FLANGECUTTER_HOME = $savedHome
+    }
+    Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ZipTest -Recurse -Force -ErrorAction SilentlyContinue
 }
-Invoke-Program "Inno Setup" $Iscc ($isccArguments + @((Join-Path $PSScriptRoot "installer.iss")))
 
 # --------------------------------------------------------------------------------------------
 Write-Step "Done"
 
-foreach ($package in @($Setup, $Zip)) {
-    if (-not (Test-Path -LiteralPath $package)) { throw "Missing package: $package" }
-    if ($Signing -and $package.EndsWith(".exe")) {
-        foreach ($signed in @($package, $Exe)) {
-            if ($null -eq (Get-ProgramOutput $SignTool @("verify", "/pa", $signed))) {
-                Write-Warning "signtool cannot verify the signature of $signed on this computer (is the certificate's root trusted here?)."
-            }
-        }
-    }
-    $item = Get-Item -LiteralPath $package
-    Write-Host ("    {0}  {1,6:N1} MB  SHA-256 {2}" -f $item.FullName, ($item.Length / 1MB),
-                (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash)
+if (-not (Test-Path -LiteralPath $Zip)) { throw "Missing package: $Zip" }
+if ($Signing -and $null -eq (Get-ProgramOutput $SignTool @("verify", "/pa", $Exe))) {
+    Write-Warning "signtool cannot verify the signature of $Exe on this computer (is the certificate's root trusted here?)."
 }
+$item = Get-Item -LiteralPath $Zip
+Write-Host ("    {0}  {1,6:N1} MB  SHA-256 {2}" -f $item.FullName, ($item.Length / 1MB),
+            (Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash)
+Write-Host "    Users unzip it (right-click > Extract All) and double-click FlangeCutter\FlangeCutter.exe."
 if (-not $Signing) {
     Write-Host "    Not signed: Windows SmartScreen may warn users (More info > Run anyway)." -ForegroundColor Yellow
 }

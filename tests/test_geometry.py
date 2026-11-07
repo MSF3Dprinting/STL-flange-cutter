@@ -8,11 +8,12 @@ import pytest
 import shapely
 import trimesh
 from manifold3d import Manifold, OpType
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 from conftest import reload_stl
-from demo_mold import demo_stl
+from demo_mold import cone_shell, demo_stl, mask_stl, mask_with_marks, rounded_cup
 from flangecutter.geometry import CutError, bolts, cutter, mesh_io
+from flangecutter.geometry.mesh_io import RIM, stl_bytes
 
 ZC = 140.0
 # The two cases of reference/test_and_render.py
@@ -275,6 +276,201 @@ def test_one_bad_cut_does_not_hide_the_others(model):
     pv = cutter.preview(model, cuts(LENGTHWISE, away))
     assert pv["cuts"][0]["error"] is None and pv["cuts"][0]["count"] == 8
     assert "does not go through the model" in pv["cuts"][1]["error"]
+
+
+# ---------------------------------------------------------------- thin shells (face-mask molds)
+def inside_fraction(solid, points) -> float:
+    """Share of the points that lie inside the solid (tested with 0.2 mm cubes)."""
+    cube = Manifold.cube((0.2, 0.2, 0.2), True)
+    cubes = [cube.translate(tuple(p)) for p in points]
+    hit = sum((solid ^ Manifold.batch_boolean(cubes[i:i + 200], OpType.Add)).volume() for i in range(0, len(cubes), 200))
+    return hit / 0.008 / max(len(points), 1)
+
+
+def shell_checks(model, res, k=300):
+    """Per cut: the protected mold face stays clean, the flange covers its own face, nothing goes past
+    the mold's edge (rim). Probes sit just outside the faces, within the flange's thickness: k random
+    probes per check, or all of them with k=None. "dirty" and "past_rim" count only what Generate added:
+    on a creased mold face (real molds) a step along the face normal can land back inside the mold."""
+    union = Manifold.batch_boolean([p.solid for p in res.parts], OpType.Add)
+    added = union - model.manifold
+    centre, normal, lab = model.mesh.triangles_center, model.normals, model.surfaces
+    rng = np.random.default_rng(0)
+    out = []
+    for c, s in zip(res.cuts, res.secs):
+        outer = np.isin(lab, model.outside)
+        flange_face = outer if c.side == "outside" else (lab >= 0) & ~outer
+
+        def probes(mask, gap, need=True):
+            # The probe's own distance to the plane counts, not its face centre's: on a leaning wall
+            # the step along the face normal also moves the probe off the plane, out of the flange.
+            p = centre[mask] + gap * normal[mask]
+            p = p[np.abs((p - s.plane.origin) @ s.plane.normal) < c.d.thickness - 0.3]
+            assert len(p) or not need, "no probes near the cut: the check would pass without testing anything"
+            return p if k is None else p[rng.choice(len(p), min(k, len(p)), replace=False)]
+
+        out.append({"dirty": inside_fraction(added, probes((lab >= 0) & ~flange_face, 0.3)),
+                    "covered": inside_fraction(union, probes(flange_face, 0.5)),
+                    "past_rim": inside_fraction(added, probes(lab == RIM, 0.3, need=False))})
+    return out
+
+
+@pytest.fixture(scope="module")
+def mask():
+    return mesh_io.load_stl(mask_stl(), "mask.stl")
+
+
+def plain_stl(solid) -> bytes:
+    """An STL of the solid as it is (stl_bytes' clean-up could merge flat test meshes)."""
+    return mesh_io.to_trimesh(solid).export(file_type="stl")
+
+
+def test_shell_surfaces_are_found(mask, model):
+    for m, far in ((mask, (-500, 0, 0)), (model, (500, 0, 120))):    # a face mask and the POC's cup
+        labels, area = m.surfaces, m.mesh.area_faces
+        assert len(m.outside) == 1 and set(np.unique(labels)) == {RIM, 0, 1}
+        assert area[labels == RIM].sum() < 0.03 * area.sum()          # the rim is a narrow band
+        nearest = np.argmin(np.linalg.norm(m.mesh.triangles_center - far, axis=1))
+        assert labels[nearest] in m.outside                            # what faces the world is outside
+    box = mesh_io.load_stl(trimesh.creation.box((30, 40, 50)).export(file_type="stl"), "box.stl")
+    assert set(np.unique(box.surfaces)) == {mesh_io.OTHER}             # not a shell: the POC's rule
+
+
+@pytest.mark.parametrize("side", ["outside", "inside"])
+def test_face_mask_cut_through_the_nose(mask, side):
+    """Through the nose the profile is wavy: one flange along one face of the whole profile, square at
+    the mold's edge, never on the other face (the POC's rule gave 6-7 pieces on both faces)."""
+    cs = cuts({"plane": {"origin": [0, 0, 0], "normal": [0, 1, 0], "x_axis": [1, 0, 0]}, "side": side, "count": 8})
+    assert len(cutter.section(mask, cs[0]).f_chains) == 1
+    res = cutter.generate(mask, cs)
+    for p in res.parts:
+        tm = reload_stl(p.stl())
+        assert tm.is_watertight and tm.nondegenerate_faces().all() and len(p.solid.decompose()) == 1
+    (check,) = shell_checks(mask, res)
+    assert check["dirty"] < 0.005 and check["covered"] > 0.95 and check["past_rim"] < 0.01, check
+    assert not {w["code"] for w in res.warnings} & {"unbolted_stretch", "offcut_dropped", "part_unbolted"}
+
+
+@pytest.mark.parametrize("side", ["outside", "inside"])
+def test_leaning_wall_gets_the_wedge_filled(side):
+    """A wall 50 deg from square: on the half where it leans away, the flange joins it over the whole
+    flange thickness. One straight strip would have to pass the protected face at the cut to reach
+    that far; each layer of the half reaches only as far as the protected face allows at its faces."""
+    shell, mid = cone_shell(lean=50)
+    # Not through stl_bytes: its clean-up merges the cone's flat 1 mm rings into long triangles, which
+    # leaves no face centres near the cut to probe.
+    cone = mesh_io.load_stl(plain_stl(shell), "cone.stl")
+    assert len(cone.outside) == 1 and set(np.unique(cone.surfaces)) == {RIM, 0, 1}
+    cs = cuts({"plane": {"origin": [0, 0, mid], "normal": [0, 0, 1]}, "side": side, "count": 8})
+    res = cutter.generate(cone, cs)
+    lay = res.lays[0]
+    assert not lay.uniform
+    fill = (0, 1) if side == "outside" else (2, 3)            # the half where the wall leans away
+    assert lay.layers[fill[1]][2].area > lay.layers[fill[0]][2].area + 50  # the outer layer reaches further
+    for p in res.parts:
+        tm = reload_stl(p.stl())
+        assert tm.is_watertight and tm.nondegenerate_faces().all() and len(p.solid.decompose()) == 1
+    (check,) = shell_checks(cone, res, k=None)      # every probe: the bolt holes alone are about 2 %
+    assert check["dirty"] < 0.005 and check["covered"] > 0.97, check
+
+
+def test_flange_stops_at_the_mold_edge(model):
+    """The lengthwise cut of the cup reaches its open top: the flange must not wrap around the rim."""
+    res = cutter.generate(model, cuts(LENGTHWISE))
+    (check,) = shell_checks(model, res)
+    assert check["past_rim"] < 0.01 and check["dirty"] < 0.005 and check["covered"] > 0.95, check
+
+
+@pytest.mark.parametrize("normal", [[0, 1, 0], [math.sqrt(0.5), math.sqrt(0.5), 0]])
+def test_flange_is_flush_with_a_slanted_mold_edge(mask, normal):
+    """The mask's edge is the plane x = 10. The faces meet it off square, and the 45 deg cut meets it at
+    a slant, so it moves with the height in the flange (review C1). No flange may reach past it: 1.0.0
+    put 2,200 to 4,700 mm3 there with Outside, the first 1.0.1 up to 2,267 mm3."""
+    origin = [0, 0, 0] if normal[0] == 0 else [-30, 0, 0]
+    past = Manifold.cube((100, 400, 400)).translate((10.05, -200, -200))
+    for side in cutter.SIDES:
+        res = cutter.generate(mask, cuts({"plane": {"origin": origin, "normal": normal}, "side": side, "count": 8}))
+        union = Manifold.batch_boolean([p.solid for p in res.parts], OpType.Add)
+        assert (union ^ past).volume() < 0.5, side
+
+
+def test_no_flange_above_the_top_of_the_mold(model):
+    """A cut 1.5 mm below the cup's open top: the flange layers above the top have no wall to join, so
+    they are left out instead of lying over the opening (review C4), and the user is told."""
+    res = cutter.generate(model, cuts({"plane": {"origin": [0, 0, 238.5], "normal": [0, 0, 1]},
+                                       "side": "outside", "bolt": "M4", "count": 6}))
+    assert all(g.area < 1.0 for z0, _, g in res.lays[0].layers if z0 >= 0)
+    assert "part_unbolted" in {w["code"] for w in res.warnings}
+
+
+def test_a_fill_across_the_start_of_a_ring_comes_back_whole():
+    """_stretches on a closed ring: a run across the ring's start point is one stretch, so its band keeps
+    the joint there (review C3: two stretches left a slit in the wedge fill)."""
+    t = np.linspace(0, 2 * np.pi, 33)[:-1]
+    p = np.c_[np.cos(t), np.sin(t)] * 50
+    ring = LineString(np.vstack([p, p[:1]]))                                 # exactly closed
+    want = np.zeros(32, bool)
+    want[[30, 31, 0, 1, 2]] = True
+    (stretch,) = cutter._stretches(ring, want, 5.0)
+    assert np.allclose(np.asarray(stretch.coords)[2], ring.coords[0])     # the old start, inside the stretch
+    assert cutter._stretches(ring, np.ones(32, bool), 5.0) == [ring]
+
+
+def test_marks_on_the_face_stay_part_of_it():
+    """A raised pad and an engraved line on the outer face (reviews R1, R2). The pad is not taken for the
+    outer surface and the line is not taken for the mold's edge, so the cut through the nose still gets
+    one flange along one face, as on the plain mask."""
+    m = mesh_io.load_stl(plain_stl(mask_with_marks()), "marks.stl")
+    assert len(m.outside) == 2 and set(np.unique(m.surfaces)) == {RIM, 0, 1, 2}   # outer face + pad top; inner face
+    c = m.mesh.triangles_center
+    groove = (np.abs(c[:, 2] - 50) < 0.6) & (np.abs(c[:, 1]) < 15.5) & (c[:, 0] < -56.5)   # not the inner face
+    assert groove.any() and np.isin(m.surfaces[groove], m.outside).all()     # its walls and floor too
+    assert m.surfaces[np.argmin(np.linalg.norm(c - (0, -60, 0), axis=1))] in m.outside   # the pad's top
+    for side in cutter.SIDES:
+        cs = cuts({"plane": {"origin": [0, 0, 0], "normal": [0, 1, 0], "x_axis": [1, 0, 0]}, "side": side, "count": 8})
+        assert len(cutter.section(m, cs[0]).f_chains) == 1, side
+
+
+@pytest.fixture(scope="module")
+def rounded():
+    return mesh_io.load_stl(plain_stl(rounded_cup()), "cup.stl")
+
+
+def test_rounded_edge_falls_back_with_a_warning(rounded):
+    """A thin-walled mold with a rounded edge: no sharp edge separates its faces, so they cannot be told
+    apart (review R4). The user is told, and the cutter uses the proof of concept's rule (decision 13)."""
+    assert set(np.unique(rounded.surfaces)) == {mesh_io.OTHER}
+    assert "edge_not_found" in {w["code"] for w in rounded.warnings}
+
+
+@pytest.mark.parametrize("y", [0, 10, 20, 30])
+def test_rounded_edge_keeps_the_protected_face_clean(rounded, y):
+    """Cuts through and beside the axis of the rounded cup, both sides: the face that must stay clean
+    does (the cavity with Outside, the outside of the cup with Inside). Off-axis cuts give long straight
+    pieces, where a sign read from a simplified chain once flipped (critic: up to 1,683 mm3 in the cup)."""
+    cavity = Manifold.cylinder(57.3, 37.4, 37.4, 160).translate((0, 0, 2.6))
+    around = Manifold.cylinder(59.9, 60, 60, 160) - Manifold.cylinder(59.9, 40.1, 40.1, 160)
+    for side, clean in (("outside", cavity), ("inside", around)):
+        res = cutter.generate(rounded, cuts({"plane": {"origin": [0, y, 30], "normal": [0, 1, 0], "x_axis": [1, 0, 0]},
+                                             "side": side, "bolt": "M4", "count": 6}))
+        assert all(reload_stl(p.stl()).is_watertight for p in res.parts)
+        union = Manifold.batch_boolean([p.solid for p in res.parts], OpType.Add)
+        assert (union ^ clean).volume() < 0.5, side
+
+
+def test_needle_merge_never_opens_the_surface():
+    """stl_bytes merges the ends of a float32 needle's short edge only when the surface stays closed
+    (review R5): here both ends share a third neighbour, and merging them gives an edge with 4 triangles,
+    so the needle stays (a warning in a slicer, not an error)."""
+    v = np.array([[0, 0, 0], [5e-5, 0, 0], [0.25, 1, 0], [0.5, 0, 0], [0.3, 0.5, 0.5], [0.3, -0.2, -0.5],
+                  [0.3, 0.5, -0.5]], np.float32).astype(np.float64)
+    f = np.array([[0, 1, 3], [1, 4, 3], [1, 2, 4], [2, 3, 4], [2, 0, 3], [1, 0, 5], [1, 5, 6], [2, 1, 6],
+                  [2, 6, 5], [0, 2, 5]])
+    assert mesh_io._closed(f)
+    merged = mesh_io._merge_needles(v, f)
+    assert len(merged) < len(f) and not mesh_io._closed(merged)          # stl_bytes keeps f then
+    cube = Manifold.cube((10, 10, 10))                                    # an ordinary solid is untouched
+    assert len(reload_stl(stl_bytes(cube)).faces) == 12 and reload_stl(stl_bytes(cube)).is_watertight
 
 
 # ---------------------------------------------------------------- bad inputs

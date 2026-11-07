@@ -3,7 +3,8 @@
 Port of reference/flange_cut.py (the proof of concept). Every cut is worked out in its own
 plane coordinates (cut plane = z 0, cut normal = +z):
 
-1. section   the wall outline in the plane, and which face of the wall looks away from the cavity
+1. section   the wall outline in the plane, and which face of the wall gets the flange (the outer or
+             inner surface of a thin shell; elsewhere the face that looks away from the cavity)
 2. layout    2D flange outline (a band on ONE face of the wall) and the bolt positions; the bolt
              line moves out while the wall would block a tool (POC rule 8)
 3. generate  one 3D build for all cuts: mold + flange slabs - holes - nut pockets, and only
@@ -16,8 +17,10 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -32,12 +35,17 @@ from shapely.ops import linemerge, substring, unary_union
 from . import CutError, warning
 from .bolts import (BOLTS, COUNT_RANGE, DEFAULT_SPACING, FASTENINGS, MAX_CUTS, SPACING_RANGE,
                     SUGGEST_PITCH, Derived, check_params, derive)
-from .mesh_io import Model, stl_bytes
+from .mesh_io import OTHER, Model, stl_bytes
 
 SIDES = ("outside", "inside")
 GAP_STEPS = 6                      # the bolt line may move out by up to 6 x 1 mm
 BLOCK_AREA = 0.01                  # mm2: a tool disc overlapping the mold's shadow more is blocked
 GRID = 0.01                        # mm: flange outlines are snapped to this grid (see _snap)
+SIMPLIFY = 0.002                   # mm: chains are simplified this much (far under GRID) before banding
+WORKERS = max(1, min(8, os.cpu_count() or 1))   # threads for building bands (GEOS releases the GIL)
+GUARD_GAP = 0.1                    # mm: the flange stops this far from the protected face and the edge
+OVERLAP = 0.6                      # mm: the flange reaches this far into the wall everywhere (POC)
+FILL_NZ = math.sin(math.radians(8))   # walls leaning more than this get the wedge under the flange filled
 SAMPLE = 0.5                       # mm: bolt lines are checked against other cuts at this step
 MIN_CROSS_DEG, SHALLOW_DEG = 15.0, 30.0
 SMALL_PART_CM3, MOSTLY_FLANGE = 0.5, 0.25
@@ -234,24 +242,49 @@ def _chains(seg: np.ndarray) -> list[LineString]:
     return [ch for ch in parts if ch.length > 1.0]
 
 
-def _outward_sign(ch: LineString, tree: shapely.STRtree, n2: np.ndarray) -> float:
-    """+1 if the wall-face normals behind this chain point to its left, else -1."""
+def _sample(line: LineString, s: np.ndarray) -> np.ndarray:
+    """Points (n, 2) at arc lengths s along a polyline. Linear in pieces and points, unlike
+    shapely.line_interpolate_point, which walks the line from its start for every point."""
+    p = shapely.get_coordinates(line)
+    cum = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
+    return np.c_[np.interp(s, cum, p[:, 0]), np.interp(s, cum, p[:, 1])]
+
+
+def _parallel(fn: Callable, items: list) -> list:
+    """fn over items, in threads: shapely (GEOS) releases the GIL, so bands are built side by side."""
+    if len(items) < 2 or WORKERS < 2:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=min(len(items), WORKERS)) as pool:
+        return list(pool.map(fn, items))
+
+
+def _outward_sign(ch: LineString, tree: shapely.STRtree, n2: np.ndarray, nz: np.ndarray) -> tuple:
+    """+1 if the wall-face normals behind this chain point to its left, else -1; and, per piece of
+    the chain, the z part of that face normal (how the wall leans, in plane coordinates)."""
     p = np.asarray(ch.coords)
     d = np.diff(p, axis=0)
     length = np.linalg.norm(d, axis=1)
     k = length > 1e-9
     left = np.c_[-d[k, 1], d[k, 0]] / length[k, None]
-    nearest = tree.nearest(shapely.points((p[:-1][k] + p[1:][k]) / 2))   # segment behind each piece
-    return 1.0 if np.sum(np.einsum("ij,ij->i", left, n2[nearest]) * length[k]) > 0 else -1.0
+    nearest = tree.nearest(shapely.points((p[:-1] + p[1:]) / 2))         # segment behind each piece
+    sign = 1.0 if np.sum(np.einsum("ij,ij->i", left, n2[nearest[k]]) * length[k]) > 0 else -1.0
+    return sign, nz[nearest]
 
 
 def _side_band(ch: LineString, s: float, dist: float, join: str = "round"):
     """Band of width `dist` on side s of a chain (+1 left, -1 right).
 
-    Closed rings go through polygon offsets: GEOS single-sided buffers misbehave on closed rings.
+    Closed rings go through polygon offsets, open chains through _swept_band. Not GEOS single-sided
+    buffers: they misbehave on closed rings, and on long wavy open chains (a real mold section,
+    500 mm) they can return a band that starts `dist` away from the chain instead of at it.
+    The chain is simplified by 2 um first, far under the 0.01 mm grid the outlines are snapped to:
+    a real section has a piece every 0.5 mm, and a band costs time per piece. Only here: the chains
+    themselves keep every piece, because signs and leans are read per piece from the mesh faces
+    behind it (a long simplified piece along a thin wall finds the other face).
     """
+    ch = shapely.simplify(ch, SIMPLIFY)
     if not ch.is_closed:
-        return ch.buffer(s * dist, single_sided=True, join_style=join, quad_segs=16)
+        return _swept_band(np.asarray(ch.coords), s, dist, join)
     poly = Polygon(ch.coords).buffer(0)
     p = np.asarray(ch.coords)
     d = np.diff(p, axis=0)
@@ -262,15 +295,35 @@ def _side_band(ch: LineString, s: float, dist: float, join: str = "round"):
     return poly.buffer(dist, join_style=join, quad_segs=16).difference(poly)
 
 
-def _prolonged(ch: LineString, d: float) -> LineString:
-    """An open chain extended by d along its end directions (closed rings are returned as is)."""
-    if ch.is_closed:
-        return ch
-    p = np.asarray(ch.coords)
-    k = min(1.0, ch.length / 2)
-    t0 = p[0] - np.asarray(ch.interpolate(k).coords[0])
-    t1 = p[-1] - np.asarray(ch.interpolate(ch.length - k).coords[0])
-    return LineString(np.vstack([p[0] + d * t0 / np.linalg.norm(t0), p, p[-1] + d * t1 / np.linalg.norm(t1)]))
+def _swept_band(p: np.ndarray, s: float, dist: float, join: str = "round"):
+    """Band of width `dist` on side s of an open polyline, as the area its side normal sweeps.
+
+    One quad per segment, plus a joint where the line turns away from side s (a fan for "round",
+    one corner for "mitre"); where it turns towards side s the quads overlap. The union is what a
+    single-sided buffer should return, and is the same where GEOS gets it right.
+    """
+    d = np.diff(p, axis=0)
+    p = np.vstack([p[:1], p[1:][np.linalg.norm(d, axis=1) > 1e-9]])
+    d = np.diff(p, axis=0)
+    if len(d) == 0:
+        return Polygon()
+    n = s * np.c_[-d[:, 1], d[:, 0]] / np.linalg.norm(d, axis=1)[:, None]
+    a, b = p[:-1], p[1:]
+    rings = list(np.stack([a, a + dist * n, b + dist * n, b], axis=1))
+    turn = d[:-1, 0] * d[1:, 1] - d[:-1, 1] * d[1:, 0]
+    for k in np.flatnonzero(s * turn < 0):
+        q, n0, n1 = p[k + 1], n[k], n[k + 1]
+        if join == "mitre" and 1 + n0 @ n1 > 0.08:        # GEOS mitre limit 5: bevel sharper turns
+            rings.append(np.array([q, q + dist * n0, q + dist * (n0 + n1) / (1 + n0 @ n1), q + dist * n1]))
+            continue
+        a0 = math.atan2(n0[1], n0[0])
+        da = math.remainder(math.atan2(n1[1], n1[0]) - a0, math.tau)
+        steps = math.ceil(abs(da) / (math.pi / 32)) if join == "round" else 1    # 16 per quarter circle
+        ang = a0 + da * np.arange(1, steps) / steps
+        rings.append(np.vstack([q, q + dist * n0, q + dist * np.c_[np.cos(ang), np.sin(ang)], q + dist * n1]))
+    closed = [np.vstack([r, r[:1]]) for r in rings]
+    ids = np.repeat(np.arange(len(closed)), [len(r) for r in closed])
+    return shapely.union_all(shapely.polygons(shapely.linearrings(np.vstack(closed), indices=ids)))
 
 
 # ---------------------------------------------------------------- 1. section
@@ -282,14 +335,18 @@ class Section:
     area: object                 # shapely geometry of the wall section
     cavities: np.ndarray         # (k, 2) cavity reference per connected region (centroid of its hull)
     points: np.ndarray           # (n, 3) section outline in world coordinates
-    f_chains: list               # chains on the flange side, with their outward signs
-    f_signs: list
-    g_chains: list               # chains on the cavity side (guard band)
+    f_chains: list               # chains on the flange side, with their outward signs and, per piece,
+    f_signs: list                # the z part of the wall's face normal (which way the wall leans)
+    f_nz: list
+    g_chains: list               # chains of the protected face and the rim (guard band)
     g_signs: list
-    g_top: tuple                 # (chains, signs) on the cavity side at z = +T and z = -T: guard bands
-    g_bottom: tuple              # that keep each flange half out of a cavity behind a leaning wall
+    levels: dict                 # z -> (guard chains, signs, wall section, flange chains) at z = +-T/2 and
+                                 # +-T, where the flange layers end: a leaning wall moves the protected
+                                 # face there, and the mold's edge may be elsewhere (or gone)
     lean_p95: float              # 95th percentile of the flange-side wall angle from square, deg
     shadow: object               # mold just beyond both flange faces, seen along the normal (tool space)
+    outlines: dict = field(default_factory=dict)   # (T, W) -> _flange_outline result: a change of the
+                                                   # bolts alone reuses it (it depends on nothing else)
 
 
 def section(model: Model, cut: Cut) -> Section:
@@ -303,34 +360,48 @@ def section(model: Model, cut: Cut) -> Section:
 
 
 def _segments(model: Model, plane: Plane, dots: np.ndarray, z: float) -> tuple:
-    """Outline at height z as 2D segments, each with the in-plane normal and lean of the mesh face
-    behind it (POC step 1). Coordinates rounded to 1e-5 mm so chains merge cleanly."""
+    """Outline at height z as 2D segments, each with the in-plane normal, the normal's z part (the
+    lean) and the surface label of the mesh face behind it (POC step 1). Coordinates rounded to
+    1e-5 mm so chains merge cleanly."""
     s = z + _segment_shift(dots - z)
     lines, fidx = trimesh.intersections.mesh_plane(model.mesh, plane.normal, plane.origin + s * plane.normal,
                                                    return_faces=True, cached_dots=dots - s)
     seg = np.round(plane.local(lines.reshape(-1, 3)).reshape(-1, 2, 3)[:, :, :2], 5)
     nf = model.normals[fidx] @ plane.R.T
     keep = np.linalg.norm(seg[:, 1] - seg[:, 0], axis=1) > 1e-9
-    seg, nf = seg[keep], nf[keep]
+    seg, nf, fidx = seg[keep], nf[keep], fidx[keep]
     n2 = nf[:, :2] / np.maximum(np.linalg.norm(nf[:, :2], axis=1), 1e-9)[:, None]
-    return seg, n2, np.degrees(np.arcsin(np.clip(np.abs(nf[:, 2]), 0, 1)))
+    labels = model.surfaces[fidx] if model.surfaces is not None else np.full(len(fidx), OTHER)
+    return seg, n2, nf[:, 2], labels
 
 
-def _split_chains(seg, n2, regions: shapely.STRtree, refs: np.ndarray, side: str) -> tuple:
+def _split_chains(seg, n2, nz, labels, outside: tuple, regions: shapely.STRtree, refs: np.ndarray, side: str,
+                  flange_signs: bool = True) -> tuple:
     """Chains on the flange side and on the guard side, each with its outward signs (POC step 2).
 
-    A segment faces away from the cavity when its normal points away from the reference point of
-    its own region of the section (each separate wall loop has its own cavity).
+    On a thin-walled mold every segment knows its surface (mesh_io.shell_surfaces): "outside" puts
+    the flange on the outer surface, "inside" on the inner one, the whole way along, and the rim
+    (the mold's edge) gets none: it joins the guard side, so the flange stops square at the edge.
+    Elsewhere (OTHER) the POC's rule applies: a segment faces away from the cavity when its normal
+    points away from the reference point of its own region of the section.
+    With flange_signs=False the flange chains come without signs and leans (the extra heights only
+    need to know where they are).
     """
     if len(seg) == 0:
-        return [], [], [], [], np.zeros(0, bool)
+        return [], [], [], [], [], np.zeros(0, bool)
     mids = seg.mean(axis=1)
-    ref = refs[regions.nearest(shapely.points(mids))]
-    away = np.einsum("ij,ij->i", n2, mids - ref) > 0
-    mask = away if side == "outside" else ~away
+    outer = np.isin(labels, outside)
+    mask = outer.copy() if side == "outside" else (labels >= 0) & ~outer
+    other = labels == OTHER
+    if other.any():
+        ref = refs[regions.nearest(shapely.points(mids[other]))]
+        away = np.einsum("ij,ij->i", n2[other], mids[other] - ref) > 0
+        mask[other] = away if side == "outside" else ~away
     tree = shapely.STRtree(shapely.points(mids))
     f, g = _chains(seg[mask]), _chains(seg[~mask])
-    return (f, [_outward_sign(c, tree, n2) for c in f], g, [_outward_sign(c, tree, n2) for c in g], mask)
+    fs = [_outward_sign(c, tree, n2, nz) for c in f] if flange_signs else []
+    gs = [_outward_sign(c, tree, n2, nz)[0] for c in g]
+    return f, [s for s, _ in fs], [z for _, z in fs], g, gs, mask
 
 
 def _section(model: Model, cut: Cut) -> Section:
@@ -342,22 +413,26 @@ def _section(model: Model, cut: Cut) -> Section:
     mp = model.manifold.transform(plane.to_plane())               # this cut plane is now z = 0
     area = _cs_to_shapely(mp.slice(0.0))
     polys = [p for p in _polygons(area) if p.area > 1e-6]
-    seg, n2, lean = _segments(model, plane, dots, 0.0)
+    seg, n2, nz, labels = _segments(model, plane, dots, 0.0)
     if not polys or len(seg) == 0:
         raise CutError(f"{cut.label} does not go through the model. Drag it onto the model or delete it.")
     regions = shapely.STRtree([p.boundary for p in polys])
     refs = np.array([p.convex_hull.centroid.coords[0] for p in polys])
-    f_chains, f_signs, g_chains, g_signs, mask = _split_chains(seg, n2, regions, refs, cut.side)
+    f_chains, f_signs, f_nz, g_chains, g_signs, mask = _split_chains(seg, n2, nz, labels, model.outside,
+                                                                     regions, refs, cut.side)
     if not mask.any():
         raise CutError(f"{cut.label}: no wall faces the {cut.side} here. Choose the other flange side.")
     if not f_chains:
         raise CutError(f"{cut.label}: the cut is too small for a flange. Move the cut.")
-    # cavity-side chains at the outer face of each flange half (z = +T and -T), for leaning walls
+    # what the flange layers meet where they end (z = +-T/2, +-T): a leaning wall moves the protected
+    # face there, and the mold's edge may lie elsewhere or the wall may not reach that far
     T, H = cut.d.thickness, cut.d.tool_clearance
-    g_levels = []
-    for z in (T, -T):
-        seg_z, n2_z, _ = _segments(model, plane, dots, z)
-        g_levels.append(_split_chains(seg_z, n2_z, regions, refs, cut.side)[2:4])
+    levels = {}
+    for z in (T / 2, T, -T / 2, -T):
+        seg_z, n2_z, nz_z, labels_z = _segments(model, plane, dots, z)
+        f_z, _, _, g_z, gs_z, _ = _split_chains(seg_z, n2_z, nz_z, labels_z, model.outside, regions, refs,
+                                                cut.side, flange_signs=False)
+        levels[z] = (g_z, gs_z, _cs_to_shapely(mp.slice(z)), f_z)
     shadow = None
     if H > 0:
         # The POC's tool cylinder runs from 0.01 mm above each flange face over the tool clearance H.
@@ -369,8 +444,9 @@ def _section(model: Model, cut: Cut) -> Section:
                  + Manifold.cube(size).translate((x0 - 1, y0 - 1, -T - 0.01 - H)))
         shadow = _cs_to_shapely((mp ^ boxes).project())
     outline = np.vstack([np.asarray(r.coords) for p in polys for r in [p.exterior, *p.interiors]])
-    return Section(plane, area, refs, plane.world(outline), f_chains, f_signs, g_chains, g_signs,
-                   g_levels[0], g_levels[1], float(np.percentile(lean[mask], 95)), shadow)
+    lean = np.degrees(np.arcsin(np.clip(np.abs(nz[mask]), 0, 1)))
+    return Section(plane, area, refs, plane.world(outline), f_chains, f_signs, f_nz, g_chains, g_signs,
+                   levels, float(np.percentile(lean, 95)), shadow)
 
 
 # ---------------------------------------------------------------- 2. layout
@@ -379,8 +455,8 @@ class Layout:
     """Flange outline and bolts of one cut, after moving the bolt line out where needed."""
 
     flange: object               # outline on the cut face (both halves)
-    flange_a: object             # outline of the side-A half (z 0..T) and of the side-B half (z -T..0);
-    flange_b: object             # the same object as `flange` unless a leaning wall trimmed one of them
+    layers: list                 # (z0, z1, outline) of side A (0..T/2, T/2..T), then side B (-T/2..0,
+                                 # -T..-T/2); empty when `flange` serves the whole slab (no leaning wall)
     pts: np.ndarray              # (n, 2) bolt positions in plane coordinates
     c: float                     # bolt line distance from the wall
     W: float                     # flange width
@@ -395,51 +471,197 @@ class Layout:
 
     @property
     def uniform(self) -> bool:
-        return self.flange_a is self.flange and self.flange_b is self.flange
+        return not self.layers
+
+    @property
+    def faces(self) -> tuple:
+        """Outlines of the flange's outer faces (side A at z = T, side B at z = -T), where washers sit."""
+        return (self.flange, self.flange) if self.uniform else (self.layers[1][2], self.layers[3][2])
 
 
-def _guard(chains: list, signs: list, W: float):
-    """Guard band W + 2 on the cavity side of the cavity-facing chains (POC step 3).
+def _side_points(ch: LineString, s: float, eps: float = 0.02) -> np.ndarray:
+    """Points just off the middle of every piece of a chain, on side s."""
+    p = np.asarray(ch.coords)
+    d = np.diff(p, axis=0)
+    length = np.linalg.norm(d, axis=1)
+    k = length > 1e-9
+    return (p[:-1][k] + p[1:][k]) / 2 + eps * s * np.c_[-d[k, 1], d[k, 0]] / length[k, None]
 
-    Open chains are prolonged past their ends first: where the wall ends (a rim), the cavity
-    beyond the chain end must be guarded too, or a leaning wall lets the flange in off-plane.
+
+def _guard(chains: list, signs: list, area, W: float):
+    """Guard band W + 2 beyond the protected surface and beyond the mold's edge (POC step 3).
+
+    Only what the protected side sees: where the wall bends sharply, the band also reaches across
+    the wall. Those pieces (inside the wall, or past it on the flange side, touching the protected
+    face nowhere) would cut away good flange, so they are dropped.
+    Grown by 0.1 mm, so the flange stops just short of the protected face and the edge: a flange
+    face that lies exactly on a mold face (a square wall, a flat rim) makes slivers that break after
+    float32 STL export.
     """
-    bands = [_side_band(_prolonged(ch, W + 2), s, W + 2) for ch, s in zip(chains, signs)]
-    return unary_union(bands) if bands else None
+    if not chains:
+        return None
+    band = unary_union([_side_band(ch, s, W + 2) for ch, s in zip(chains, signs)]).difference(area)
+    near = np.vstack([_side_points(ch, s) for ch, s in zip(chains, signs)])
+    keep = [p for p in _polygons(band) if shapely.contains_xy(p, near[:, 0], near[:, 1]).any()]
+    return unary_union(keep).buffer(GUARD_GAP) if keep else None
+
+
+def _stretches(ch: LineString, want: np.ndarray, cut: float) -> list[LineString]:
+    """The stretches of a chain whose pieces are wanted, at least `cut` from the ends of an open chain.
+
+    On a closed ring a stretch may run across the ring's start point. The ring is then turned to start
+    at a piece that is not wanted, so the stretch comes back whole, with its joint at the old start
+    (two open stretches would end square there and leave a slit in the band).
+    """
+    p = np.asarray(ch.coords)
+    if ch.is_closed and want.all():
+        return [ch]
+    if ch.is_closed and want.any() and want[0] and want[-1]:
+        j = int(np.argmin(want))                        # the first piece that is not wanted
+        p = np.vstack([p[j:-1], p[:j + 1]])
+        want = np.roll(want, -j)
+        ch = LineString(p)
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
+    if not ch.is_closed:
+        mid = (s[:-1] + s[1:]) / 2
+        want = want & (mid > cut) & (mid < s[-1] - cut)
+    edges = np.flatnonzero(np.diff(np.r_[0, want.astype(int), 0]))
+    return [substring(ch, s[a], s[b]) for a, b in zip(edges[::2], edges[1::2]) if s[b] - s[a] > 1.0]
+
+
+def _uncovered(ch: LineString, wall, W: float, step: float = 1.0) -> list:
+    """Two-sided bands (W + 1 wide, flat ends) along the stretches of a chain that have no wall within
+    the flange's reach (W + 2) in `wall`, the wall section at one height: the mold's edge is lower
+    there, so a flange layer at that height would stand past it. Stretches under 1 mm are bridged."""
+    s = np.linspace(0.0, ch.length, max(2, int(ch.length / step) + 1))
+    if wall is None or wall.is_empty:
+        far = np.ones(len(s), bool)
+    else:
+        far = ~shapely.dwithin(shapely.points(_sample(ch, s)), wall, W + 2)
+    edges = np.flatnonzero(np.diff(np.r_[0, far.astype(int), 0]))
+    out = []
+    for a, b in zip(edges[::2], edges[1::2]):
+        lo, hi = max(0.0, s[a] - step / 2), min(ch.length, s[b - 1] + step / 2)
+        if hi - lo > 1.0:
+            out.append(substring(ch, lo, hi).buffer(W + 1, cap_style="flat"))
+    return out
+
+
+def _end_cuts(chains: list, level: tuple, W: float) -> list:
+    """Per flange chain at the cut: what of its own bands lies past the mold's edge at one height.
+
+    `level` holds what that height sees: guard chains, their signs, the wall section, flange chains.
+    Along a stretch of the chain with no wall within the flange's reach at that height, the mold's
+    edge is lower: its bands go there (_uncovered). Where a flange chain at that height ends against
+    a guard chain (the rim; on a model that is not a thin shell, the face where the flange side flips),
+    the guard chain is carried on past that end and its guard band goes too, from the chain at the
+    cut nearest to that end, so the flange ends square and flush with the edge (like 1.0.0's prolonged
+    guard chains). 3 W + 2 far and wide: where the face meets the edge at a shallow angle, the band
+    crosses the edge line far from the end.
+    Each of these cuts trims its own chain only, never the flange of another wall across a narrow
+    opening (prolonged chains crossing there once erased a whole flange, decision 43).
+    Returns per chain the region to remove, or None.
+    """
+    g_chains, g_signs, wall, f_level = level
+    out = [_uncovered(ch, wall, W) for ch in chains]
+    if not chains:
+        return []
+    L = 3 * W + 2
+    ends = {}                                   # end point -> guard chains that end there
+    for g, s in zip(g_chains, g_signs):
+        if not g.is_closed:
+            p = np.asarray(g.coords)
+            ends.setdefault(tuple(p[0]), []).append((g, s, True))
+            ends.setdefault(tuple(p[-1]), []).append((g, s, False))
+    for f in f_level:
+        if f.is_closed:
+            continue
+        for P in (np.asarray(f.coords[0]), np.asarray(f.coords[-1])):
+            matches = ends.get(tuple(P), [])
+            if not matches:
+                continue
+            i = int(np.argmin(shapely.distance(chains, Point(P))))
+            for g, s, at_start in matches:
+                k = min(1.0, g.length / 2)
+                q = np.asarray(g.interpolate(k if at_start else g.length - k).coords[0])
+                e = (P - q) / max(float(np.linalg.norm(P - q)), 1e-12)          # the guard chain's way on, past P
+                out[i].append(_swept_band(np.array([P + L * e, P]) if at_start else np.array([P, P + L * e]), s, L))
+    return [unary_union(c) if c else None for c in out]
 
 
 def _flange_outline(sec: Section, d: Derived, W: float) -> tuple:
-    """Band W on the flange side + overlap strip into the wall - guard band on the cavity side (POC 3).
+    """Band W on the flange side + overlap strip into the wall - guard band (POC step 3).
 
-    Each half also loses the guard band found at its own outer face (z = +T or -T): where the wall
-    leans, the straight flange slab would otherwise poke through the wall into the cavity.
-    Returns (cut face outline, side-A outline, side-B outline).
+    The slab is straight, the wall may lean. Each half of the slab (side A: z 0..T, side B: -T..0)
+    is built as two layers, 0..T/2 and T/2..T, and each layer loses the guard bands found at both
+    of its faces: on a straight wall the protected face comes closest to the flange at one of them,
+    so no layer pokes through it.
+    Where the wall leans away from the flange on a half, a flange that only touches the wall leaves
+    a wedge-shaped gap under it. On that half and stretch the strip into the wall goes as deep as
+    the flange is wide, and the guards cut it at the protected face, which moves away there too:
+    the outer layer reaches further than the inner one. Not within W of the mold's edge, which may
+    recede above or below the cut.
+    Every chain's bands also lose, per layer, what lies past the mold's edge at both faces of the
+    layer (_end_cuts): the flange ends flush with the edge at every height it is built for.
+    Bands and guards are independent of each other, so they are built in threads.
+    Returns (cut-face outline, layers); layers are empty when one outline serves the whole slab.
     """
-    parts = []
-    for ch, s in zip(sec.f_chains, sec.f_signs):
-        parts += [_side_band(ch, s, W), _side_band(ch, -s, d.overlap, "mitre")]
-    flange = unary_union(parts)
-    guard = _guard(sec.g_chains, sec.g_signs, W)
-    flange = _snap(flange.difference(guard) if guard is not None else flange)
-    halves = []
-    for chains, signs in (sec.g_top, sec.g_bottom):
-        g = _guard(chains, signs, W)
-        half = _snap(flange.difference(g)) if g is not None else flange
-        halves.append(flange if half.area > flange.area - 1e-6 else half)    # unchanged: share the object
-    cut_face = flange if halves[0] is flange or halves[1] is flange else _snap(unary_union(halves))
-    return cut_face, halves[0], halves[1]
+    T = d.thickness
+    levels = {0.0: (sec.g_chains, sec.g_signs, sec.area, sec.f_chains), **sec.levels}
+
+    def bands(item):
+        ch, s, nz = item
+        base = unary_union([_side_band(ch, s, W), _side_band(ch, -s, OVERLAP, "mitre")])
+        deep = {}
+        for half in (1, -1):    # the wall leans away from the flange on side A where its normal points up
+            fill = [_side_band(piece, -s, W) for piece in _stretches(ch, half * nz > FILL_NZ, W)]
+            deep[half] = unary_union(fill) if fill else None
+        return base, deep
+
+    jobs = [lambda lv=lv: _guard(*lv[:3], W) for lv in levels.values()]
+    jobs += [lambda item=item: bands(item) for item in zip(sec.f_chains, sec.f_signs, sec.f_nz)]
+    built = _parallel(lambda job: job(), jobs)
+    guards = dict(zip(levels, built[:len(levels)]))
+    chain_bands = built[len(levels):]
+    cuts = {z: _end_cuts(sec.f_chains, lv, W) for z, lv in levels.items()}
+
+    def trim(g, zs, snap=True):
+        for z in zs:
+            if guards[z] is not None:
+                g = g.difference(guards[z])
+        return _snap(g) if snap else g
+
+    def past_edge(g, i, zs):
+        for z in zs:
+            if cuts[z][i] is not None:
+                g = g.difference(cuts[z][i])
+        return g
+
+    base = [trim(past_edge(b, i, (0.0,)), (0.0,), snap=False) for i, (b, _) in enumerate(chain_bands)]
+    flange = _snap(unary_union(base))
+    layers = []
+    for half in (1, -1):
+        bodies = [b if deep[half] is None else b.union(deep[half]) for b, (_, deep) in zip(base, chain_bands)]
+        for z0, z1 in ((0.0, half * T / 2), (half * T / 2, half * T)):
+            parts = [past_edge(body, i, (z0, z1)) for i, body in enumerate(bodies)]
+            layers.append((min(z0, z1), max(z0, z1), trim(unary_union(parts), (z0, z1))))
+    no_fill = all(deep[1] is None and deep[-1] is None for _, deep in chain_bands)
+    if no_fill and all(g.area > flange.area - 1e-6 for _, _, g in layers):
+        return flange, []
+    return _snap(unary_union([layers[0][2], layers[2][2]])), layers
 
 
 def _clear_of_others(cut: Cut, plane: Plane, line: LineString, others: list[Cut]) -> tuple:
     """Sample a bolt line and keep the points where a bolt clears every other cut.
 
-    A bolt's hardware and tools reach R = T + tool clearance along its own normal and r = washer/2 + 0.5
+    A bolt's hardware and tools reach R = T + max(tool clearance, protrusion) along its own normal and
+    r = washer/2 + 0.5
     sideways. At a sample p, the closest that reaches to another plane j is
     max(0, |dist(p, P_j)| - R |cos|) - r sin  (cos, sin of the angle between the planes); it must
     stay beyond flange j (T_j) and the bolt ends, nuts and heads sticking out of it (protrusion_j).
     """
     s = np.linspace(0.0, line.length, max(2, math.ceil(line.length / SAMPLE) + 1))
-    p = plane.world(shapely.get_coordinates(shapely.line_interpolate_point(line, s)))
+    p = plane.world(_sample(line, s))
     d = cut.d
     reach = d.thickness + max(d.tool_clearance, d.protrusion)
     ok, culprits = np.ones(len(s), bool), set()
@@ -579,7 +801,12 @@ def layout(cut: Cut, sec: Section, others: list[Cut]) -> Layout:
         if not blocked:
             break
     k, c, W, blocked, pts, suggested, lines, pieces, empty, culprits = best
-    lay = Layout(*_flange_outline(sec, d, W), pts, c, W, float(k), blocked, suggested, lines, pieces,
+    key = (d.thickness, round(W, 6))
+    if key not in sec.outlines:
+        if len(sec.outlines) > 8:
+            sec.outlines.pop(next(iter(sec.outlines)))
+        sec.outlines[key] = _flange_outline(sec, d, W)
+    lay = Layout(*sec.outlines[key], pts, c, W, float(k), blocked, suggested, lines, pieces,
                  empty, culprits, [dict(w, message=f"{cut.label}: {w['message'][0].lower()}{w['message'][1:]}")
                                    for w in d.warnings])
     _check_layout(cut, sec, lay)
@@ -620,7 +847,7 @@ def _check_layout(cut: Cut, sec: Section, lay: Layout) -> None:
             w.append(warning("bolts_close", f"{label}: some bolts are only {dist.min():.1f} mm apart.",
                              "Lower the bolt count or use a smaller bolt."))
     discs = shapely.buffer(shapely.points(lay.pts), d.bolt.washer / 2, quad_segs=8)
-    both = (lay.flange if lay.uniform else lay.flange_a.intersection(lay.flange_b)).buffer(0.05)  # a washer each side
+    both = (lay.flange if lay.uniform else lay.faces[0].intersection(lay.faces[1])).buffer(0.05)  # a washer each side
     bad = shapely.intersects(discs, sec.area) | ~shapely.contains(both, discs)
     if bad.any():
         w.append(warning("washer_fit", f"{label}: the washer does not fit on the flange at bolt "
@@ -825,21 +1052,30 @@ class Result:
 def _flange_solid(cut: Cut, lay: Layout) -> Manifold:
     """Flange slab straddling the plane, from -T to +T (POC step 5), in plane coordinates.
 
-    Where a leaning wall gave the two halves different outlines, one slab is built over both
-    outlines and each half loses the other half's extra strip, from 0.02 mm off the plane outwards.
-    The trimming prisms reach past the slab edge, so no two faces coincide (coplanar faces break
-    after float32 STL export) and no face lies on the plane where the parts are split later.
+    Where the layers have different outlines (a leaning wall, the mold's edge): a core over the
+    cut-face outline from -T/2 to T/2, of which each inner layer loses what is not its own from
+    0.02 mm off the plane outwards (the trimming prisms reach past the core), plus the outer layers
+    (T/2..T, -T..-T/2) with their own outlines, sitting exactly on the core at +-T/2. This exact
+    stacking is on purpose: outer layers that overlapped the core by 0.02 mm, or were one grid step
+    smaller, left slivers that were not watertight after float32 STL export. No face lies on the
+    plane where the parts are split later.
     """
     T, e = cut.d.thickness, 0.02
-    slab = _shapely_to_cs(lay.flange).extrude(2 * T).translate((0, 0, -T))
     if lay.uniform:
-        return slab
-    for own, other, z0 in ((lay.flange_a, lay.flange_b, e), (lay.flange_b, lay.flange_a, -T - 1)):
-        extra = other.difference(own)
+        return _shapely_to_cs(lay.flange).extrude(2 * T).translate((0, 0, -T))
+    core = _shapely_to_cs(lay.flange).extrude(T).translate((0, 0, -T / 2))
+    a_in, a_out, b_in, b_out = (own for _, _, own in lay.layers)
+    trims = []
+    for own, z0 in ((a_in, e), (b_in, -T / 2 - 1)):
+        extra = lay.flange.difference(own)
         if extra.area > 1e-3:
             trim = _snap(extra.buffer(0.5).difference(own))
-            slab -= _shapely_to_cs(trim).extrude(T + 1 - e).translate((0, 0, z0))
-    return slab
+            trims.append(_shapely_to_cs(trim).extrude(T / 2 + 1 - e).translate((0, 0, z0)))
+    if trims:
+        core = core - Manifold.batch_boolean(trims, OpType.Add)
+    outer = [_shapely_to_cs(own).extrude(T / 2).translate((0, 0, z0))
+             for own, z0 in ((a_out, T / 2), (b_out, -T)) if not own.is_empty]
+    return Manifold.batch_boolean([core, *outer], OpType.Add)
 
 
 def _fastening_cutters(cut: Cut, lay: Layout) -> Manifold | None:

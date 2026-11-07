@@ -10,6 +10,7 @@ from werkzeug.serving import make_server
 
 from conftest import SAMPLE, reload_stl
 from flangecutter import __main__ as launcher
+from flangecutter import __version__
 from flangecutter.server import create_app
 from flangecutter.session import Session, app_dir
 
@@ -166,7 +167,28 @@ def test_single_instance_lock():
     thread.start()
     try:
         (app_dir() / launcher.LOCK_NAME).write_text(json.dumps({"port": server.server_port, "pid": 1}))
-        assert launcher.running_instance() == f"http://127.0.0.1:{server.server_port}/"
+        assert launcher.running_instance() == (f"http://127.0.0.1:{server.server_port}/", __version__)
     finally:
         server.shutdown()
     assert launcher.running_instance() is None          # stale lock file: the next start takes over
+
+
+def test_other_version_is_closed_on_request(monkeypatch):
+    """Portable copies: when another version still runs, the user can close it and start this one."""
+    app = create_app(Session())
+    server = make_server("127.0.0.1", 0, app, threaded=True)
+    app.extensions["shutdown"] = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/"
+    (app_dir() / launcher.LOCK_NAME).write_text(json.dumps({"port": server.server_port, "pid": 1}))
+    try:
+        monkeypatch.setattr(launcher, "_interactive", lambda: False)
+        assert not launcher.replace_other_version(url, "1.0.0")          # nobody to ask: keep it running
+        assert launcher.running_instance() == (url, __version__)
+        answers = []
+        monkeypatch.setattr(launcher, "_interactive", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda prompt="": answers.append(prompt) or "")
+        assert launcher.replace_other_version(url, "1.0.0")              # Enter: it quits
+        assert len(answers) == 1 and launcher.running_instance() is None
+    finally:
+        server.shutdown()

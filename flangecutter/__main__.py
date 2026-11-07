@@ -1,7 +1,8 @@
 """Start Flange Cutter: `python -m flangecutter` (or FlangeCutter.exe).
 
 Runs a local web server on 127.0.0.1 only (a free port) and opens the default browser.
-If Flange Cutter is already running, it only opens the browser on the running app.
+If Flange Cutter is already running, it only opens the browser on the running app. If another
+version is running (an older portable copy, for example), it offers to close that one first.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import logging.handlers
 import os
 import sys
 import threading
+import time
 import urllib.request
 import webbrowser
 
@@ -20,6 +22,7 @@ from .session import app_dir      # light: the geometry libraries load only afte
 
 LOCK_NAME = "flangecutter.lock"
 log = logging.getLogger("flangecutter")
+_LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 127.0.0.1: never ask a proxy
 
 
 def setup_logging() -> str:
@@ -35,16 +38,62 @@ def setup_logging() -> str:
     return str(path)
 
 
-def running_instance() -> str | None:
-    """URL of a Flange Cutter that is already running, from the lock file, or None."""
+def running_instance() -> tuple[str, str] | None:
+    """(URL, version) of a Flange Cutter that is already running, from the lock file, or None."""
     try:
         info = json.loads((app_dir() / LOCK_NAME).read_text(encoding="utf-8"))
         url = f"http://127.0.0.1:{int(info['port'])}/"
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # never ask a proxy
-        with opener.open(url + "api/ping", timeout=2) as r:
-            return url if json.load(r).get("app") == "flangecutter" else None
-    except (OSError, ValueError, KeyError, TypeError):
+        with _LOCAL.open(url + "api/ping", timeout=2) as r:
+            ping = json.load(r)
+        return (url, str(ping.get("version", "?"))) if ping.get("app") == "flangecutter" else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def stop_instance(url: str, wait: float = 15.0) -> bool:
+    """Ask a running Flange Cutter to quit, as its Quit button does. True once it no longer answers."""
+    request = urllib.request.Request(url + "api/shutdown", data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+    try:
+        _LOCAL.open(request, timeout=5).close()
+    except OSError:
+        return False
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if running_instance() is None:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _interactive() -> bool:
+    """True when someone can answer in the console window (a double-click start)."""
+    return bool(sys.stdin) and sys.stdin.isatty()
+
+
+def replace_other_version(url: str, version: str) -> bool:
+    """Another version is running, for example an older portable copy in another folder. It keeps the
+    lock and the session, so this one cannot start next to it. Offer to close it.
+
+    Returns True when the other version has quit and this one may start.
+    """
+    print(f"{APP_NAME} {version} is still running: {url}")
+    if not _interactive():
+        return False
+    print(f"To start {APP_NAME} {__version__}, the running version must close. "
+          "Save your settings in it first if you need them.")
+    try:
+        input("Press Enter to close it now, or close this window to keep it. ")
+    except EOFError:
+        return False
+    if stop_instance(url):
+        return True
+    print("The running version did not close. Click Quit in it, then start Flange Cutter again.")
+    try:
+        input("Press Enter to close this window. ")
+    except EOFError:
+        pass
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,8 +108,11 @@ def main(argv: list[str] | None = None) -> int:
             pass
     log_file = setup_logging()
 
-    url = running_instance()
-    if url:
+    found = running_instance()
+    if found and found[1] != __version__ and replace_other_version(*found):
+        found = None
+    if found:
+        url = found[0]
         print(f"{APP_NAME} is already running: {url}")
         if not args.no_browser:
             webbrowser.open(url)

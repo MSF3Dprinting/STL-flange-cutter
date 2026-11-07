@@ -45,6 +45,25 @@ SCREEN = """([x, y, z]) => {      // a point of the 3D view -> page pixels
   const p = v.camera.position.clone().set(x, y, z).project(v.camera);
   return [r.left + (p.x + 1) / 2 * r.width, r.top + (1 - p.y) / 2 * r.height];
 }"""
+BADGE = """(i) => {                 // where cut i's number badge is (3D point)
+  const v = window.flangeCutter.viewer, c = v.cuts.get(window.flangeCutter.state.cuts[i].id);
+  return c.label.getWorldPosition(c.label.position.clone()).toArray();
+}"""
+# A page point far from the selected cut's gizmo where cut i's plane is the first thing a click hits
+PLANE_CLICK = """(i) => {
+  const v = window.flangeCutter.viewer, r = v.renderer.domElement.getBoundingClientRect();
+  const sel = v.cuts.get(v.selected), g = sel.obj.getWorldPosition(sel.obj.position.clone()).project(v.camera);
+  const gx = r.left + (g.x + 1) / 2 * r.width, gy = r.top + (1 - g.y) / 2 * r.height;
+  const fill = v.cuts.get(window.flangeCutter.state.cuts[i].id).fill;
+  const targets = [...v.cuts.values()].flatMap((c) => [c.fill, c.label]);
+  for (let y = r.top + 20; y < r.bottom - 20; y += 12) for (let x = r.left + 20; x < r.right - 20; x += 12) {
+    if (Math.hypot(x - gx, y - gy) < 0.3 * Math.min(r.width, r.height)) continue;
+    v.raycaster.setFromCamera({ x: ((x - r.left) / r.width) * 2 - 1, y: 1 - ((y - r.top) / r.height) * 2 }, v.camera);
+    const hits = v.raycaster.intersectObjects(targets);
+    if (hits.length && hits[0].object === fill) return [x, y];
+  }
+  return null;
+}"""
 
 
 @pytest.fixture()
@@ -290,6 +309,27 @@ def test_fragile_paths(page):
         gap = abs(sum(n * (p - q) for n, p, q in zip(a["normal"], a["origin"], b["origin"])))
         assert abs(dot) < 0.99 or gap > 20, (a, b)
     expect(page.locator("#step-side legend")).to_contain_text("Cut 3")
+
+    # Clicks right next to the selected cut's gizmo, where other cuts cross it, keep that cut selected
+    # (a slightly missed handle once selected cut 1, and the next rotation moved the wrong cut)
+    planes = page.evaluate(f"{STATE}.cuts.map((c) => c.plane)")
+    centre = page.evaluate(SCREEN, planes[2]["origin"])
+    for dx, dy in [(6, 6), (-8, 4), (10, -10), (-12, -12), (20, 0)]:
+        page.mouse.move(centre[0] + dx, centre[1] + dy)
+        if page.evaluate("window.flangeCutter.viewer.gizmo.axis") is None:
+            page.mouse.down()
+            page.mouse.up()
+            assert page.evaluate(f"{STATE}.sel") == 2
+    assert page.evaluate(f"{STATE}.cuts.map((c) => c.plane)") == planes
+    # ... but a click on another cut's plane away from the gizmo selects that cut, and so does a click on
+    # its number badge (review R3: the first rule once made other cuts almost impossible to click)
+    spot = page.evaluate(PLANE_CLICK, 0)
+    assert spot, "no place where cut 1's plane is in front"
+    page.mouse.click(*spot)
+    assert page.evaluate(f"{STATE}.sel") == 0
+    page.mouse.click(*page.evaluate(SCREEN, page.evaluate(BADGE, 1)))
+    assert page.evaluate(f"{STATE}.sel") == 1
+    assert page.evaluate(f"{STATE}.cuts.map((c) => c.plane)") == planes
 
     # Cut 2 misses the model: only cut 2 has an error, the others keep their preview; Generate waits
     page.locator(".cut-row").nth(1).click()

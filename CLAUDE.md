@@ -14,7 +14,7 @@ py -3.12 -m venv .venv   # or: & "$env:LOCALAPPDATA\Programs\Python\Python312\py
 .\.venv\Scripts\python.exe -m flangecutter                    # run the app (--no-browser, --port N)
 .\.venv\Scripts\python.exe -m pytest tests -q                 # all tests (about 1-2 minutes)
 .\.venv\Scripts\python.exe -m pytest tests -q -m "not ui"     # without the browser test
-powershell -ExecutionPolicy Bypass -File build\build_windows.ps1   # installer + portable ZIP into build\out
+powershell -ExecutionPolicy Bypass -File build\build_windows.ps1   # portable ZIP into build\out (no installer)
 ```
 
 **Run the tests before committing.** To refresh the user manual's screenshots in
@@ -24,15 +24,19 @@ them to a temporary folder).
 ## Layout
 
 - `flangecutter/geometry/`: `bolts.py` (all ISO data, fastening registry, parameter metadata,
-  bolt length rule), `mesh_io.py` (load, repair, STL, ZIP), `cutter.py` (everything geometric).
+  bolt length rule), `mesh_io.py` (load, repair, surface labels, STL clean-up, ZIP), `cutter.py`
+  (everything else geometric).
 - `flangecutter/server.py` (thin Flask routes), `session.py` (memory + app folder),
   `__main__.py` (launcher, single instance, logging).
 - `flangecutter/static/`: `index.html`, `app.css`, `js/{main,viewer,panel,cutview,api}.js`,
   `vendor/three/` (three.js r187, never edit).
-- `tests/`: `test_geometry.py`, `test_api.py`, `test_ui.py`, `demo_mold.py` (POC test mold).
+- `tests/`: `test_geometry.py`, `test_api.py`, `test_ui.py`, `demo_mold.py` (test molds: POC cup,
+  face mask, mask with marks, cone, rounded cup).
 - `reference/`: the proof of concept. **Never change these files.**
-- `build/`: PyInstaller spec, Inno Setup script, `build_windows.ps1`. `docs/`: manual, architecture,
-  decisions, acceptance checklist.
+- `data/*.stl`: real molds made from patient scans, git-ignored. **Never commit, copy or print
+  them**; report only aggregate numbers from them.
+- `build/`: PyInstaller spec, `build_windows.ps1` (portable ZIP only, decision 46). `docs/`: manual,
+  architecture, decisions, acceptance checklist.
 
 ## Conventions
 
@@ -52,6 +56,23 @@ them to a temporary folder).
 - Union everything first, **split by the planes last**; never move the 3D split off the plane.
 - Snap flange outlines to 0.01 mm before extruding; float32 STL export breaks sub-micron edges.
   Every part must stay watertight after STL export and reload (tests check this).
+- No GEOS single-sided buffers (wrong on closed rings; on long wavy open chains the band can start
+  W away from the chain): rings use polygon offsets, open chains `_swept_band`.
+- Simplify only the band geometry (2 µm, in `_side_band`), never the chains: signs and leans are
+  read per piece from the mesh face behind it, and a long simplified piece along a thin wall finds
+  the other face and flips the sign.
+- Stack the flange layers exactly (outer layers on the core at ±T/2): overlapping or one grid step
+  smaller layers left slivers that were not watertight after export.
+- A flange face must never lie on a mold face (slivers after export): the guard keeps 0.1 mm
+  (`GUARD_GAP`).
+- Flange end cuts (`_end_cuts`) trim only their own chain's bands; never prolong guard chains
+  globally (across a narrow opening that once erased a whole flange, decision 43).
+- `stl_bytes` cleans up and merges flat meshes (a test cone: 23,552 to 1,024 triangles). Tests that
+  need a mesh's own triangles write it with `mesh_io.to_trimesh(m).export(file_type="stl")`.
+- Validation probes: keep a probe only where the probe itself (not its face center) lies within
+  T - 0.3 mm of the cut; judge "face clean" and "past the edge" on added material only (parts minus
+  mold); an empty probe set fails the face-clean and coverage checks (the past-the-edge set may be
+  empty: not every cut reaches the edge). Add a volume check past the edge: the probes missed an overhang.
 - trimesh 5 `fix_normals()` needs scipy: call repair steps one by one. Read `model.normals` and
   `model.bounds`, not the trimesh cached properties (slow re-hashing).
 - Manifold evaluates lazily; `to_mesh()` returns float32; heights come from `bounding_box()`.

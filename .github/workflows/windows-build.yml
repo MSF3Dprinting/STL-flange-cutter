@@ -1,11 +1,11 @@
-# Windows packages of Flange Cutter: runs all tests, then build/build_windows.ps1 (the same script
-# used on a laptop), and uploads the per-user installer and the portable ZIP as two artifacts.
+# Windows package of Flange Cutter: runs all tests, then build/build_windows.ps1 (the same script
+# used on a laptop), and uploads the portable ZIP as an artifact. There is no installer.
 #
 # Code signing is optional. It runs only when these repository secrets exist:
 #   CODESIGN_PFX_BASE64    the code signing certificate (.pfx file) as base64, for example from
 #                          [Convert]::ToBase64String([IO.File]::ReadAllBytes("codesign.pfx"))
 #   CODESIGN_PFX_PASSWORD  its password
-# Without them (and always for pull requests from forks) the packages are built unsigned.
+# Without them (and always for pull requests from forks) the exe is built unsigned.
 name: Windows build
 
 on:
@@ -50,17 +50,7 @@ jobs:
       - name: Run the tests
         run: python -m pytest tests -q
 
-      - name: Install Inno Setup if it is missing
-        run: |
-          $places = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-                      "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe")
-          if ((Get-Command ISCC.exe -ErrorAction SilentlyContinue) -or ($places | Where-Object { Test-Path $_ })) {
-            Write-Host "Inno Setup is installed."
-          } else {
-            choco install innosetup -y --no-progress
-          }
-
-      - name: Build the installer and the portable ZIP
+      - name: Build the portable ZIP
         env:
           CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
@@ -77,13 +67,6 @@ jobs:
             if ($signing.Count) { Remove-Item -LiteralPath $signing.CertificateFile -Force }
           }
           exit $LASTEXITCODE
-
-      - name: Upload the installer
-        uses: actions/upload-artifact@v7
-        with:
-          path: build/out/FlangeCutter-Setup-*.exe
-          archive: false
-          if-no-files-found: error
 
       - name: Upload the portable ZIP
         uses: actions/upload-artifact@v7

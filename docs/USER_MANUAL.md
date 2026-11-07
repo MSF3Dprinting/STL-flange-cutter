@@ -1,6 +1,6 @@
 # Flange Cutter user manual
 
-Version 1.0
+Version 1.0.1
 
 ## What Flange Cutter does
 
@@ -16,34 +16,36 @@ and a list of the bolts, nuts and washers you need.
 
 Flange Cutter works offline. Your files stay on your computer.
 
-## Install, start, update and remove
+## Unzip, start, update and remove
 
-You do not need admin rights for any of this.
+Flange Cutter comes as one ZIP file. Nothing is installed, and you do not need admin rights.
 
-**With the installer**
+**Unzip**
 
-1. Double-click `FlangeCutter-Setup-1.0.0.exe`.
-2. If Windows shows "Windows protected your PC", see the next section.
-3. Click through Setup. Tick "Create a desktop shortcut" if you want one.
-4. Setup installs Flange Cutter in your own user folder and adds it to the Start menu.
-
-**With the portable ZIP** (when your laptop blocks installers)
-
-1. Right-click `FlangeCutter-1.0.0-portable.zip` and choose **Extract All**. Pick a folder where
+1. Right-click `FlangeCutter-1.0.1-portable.zip` and choose **Extract All**. Pick a folder where
    you can save files, for example **Documents**.
 2. Open the new **FlangeCutter** folder and double-click **FlangeCutter.exe**.
+3. If Windows shows "Windows protected your PC", see the next section.
 
-**Start and quit.** Start Flange Cutter from the Start menu (or FlangeCutter.exe). A small black
-window opens ("Close this window to quit") and your web browser shows the app. Starting it again
-while it runs only opens the browser on it. To quit, click **Quit** at the bottom right, or close
-the black window.
+Do not start FlangeCutter.exe from inside the ZIP without extracting it: it does not work there.
+For a desktop shortcut, right-click **FlangeCutter.exe** and choose **Show more options > Send to >
+Desktop (create shortcut)** (Windows 10: **Send to** is in the first menu).
 
-**Update.** Run the setup of the new version; your settings stay. Portable: delete the old
-FlangeCutter folder and extract the new one.
+**Start and quit.** Double-click **FlangeCutter.exe** (or your shortcut). A small black window
+opens ("Close this window to quit") and your web browser shows the app. Starting it again while it
+runs only opens the browser on it. To quit, click **Quit** at the bottom right, or close the black
+window.
 
-**Remove.** **Settings > Apps > Installed apps > Flange Cutter > Uninstall**. Portable: delete the
-FlangeCutter folder. Your settings and the log stay in `%LOCALAPPDATA%\FlangeCutter`; delete that
-folder to remove them too.
+**Update.** Quit Flange Cutter. Delete the old **FlangeCutter** folder and extract the new ZIP in
+its place. Your settings stay. If an older version still runs when you start the new one, the black
+window asks you to press Enter to close the older version first.
+
+**Remove.** Delete the **FlangeCutter** folder. Your settings and the log stay in
+`%LOCALAPPDATA%\FlangeCutter`; delete that folder to remove them too.
+
+**Version 1.0.0 was installed with Setup?** Remove it once: open **Settings > Apps > Installed apps**
+(Windows 10: **Apps & features**), find **Flange Cutter** and choose **Uninstall**. Your settings
+stay. Then use the ZIP as above.
 
 ## If Windows protects your PC
 
@@ -57,7 +59,7 @@ Flange Cutter, ask your IT team.
 
 ## The five steps
 
-The panel on the right has five steps. A step opens when the step before it is done. The 3D view
+The panel on the right has five steps. Steps 2 to 5 open as soon as a model is open. The 3D view
 on the left shows the model and the cuts. Drag to turn the view, right-drag to move it, use the
 mouse wheel to zoom. **Fit view** shows the whole model again.
 
@@ -95,8 +97,13 @@ To place the selected cut:
 ![Step 2: a lengthwise cut placed with the number fields](screenshots/02-cut-plane.png)
 
 **Several cuts.** Click **Add cut** for another cut (up to 6). It starts with the same settings as
-the selected cut, turned or moved so it does not lie on another cut. Click a cut in the list, or
-its plane in the 3D view, to select it. **Delete cut** removes the selected cut.
+the selected cut, turned or moved so it does not lie on another cut. **Delete cut** removes the
+selected cut.
+
+**Select a cut.** Click it in the list, or click its number in the 3D view. You can also click its
+plane, away from the handles of the selected cut (the arrow or rings you drag). Next to those
+handles, and where the selected cut's plane crosses another plane, a click does not change the
+selected cut, so a slightly missed handle never switches cuts. The list always works.
 
 Every cut has its own settings in steps 3 and 4. The step titles name the cut they change.
 
@@ -111,7 +118,16 @@ the two cuts never meet.
 - **Outside** (normal choice): the flange grows from the outer face of the wall.
 - **Inside**: the flange grows from the inner face.
 
-The mold face on the other side stays clean.
+The mold face on the other side stays clean. Choose the side that is **not** the mold surface. For
+example, when plastic is formed over the outside of the mold (like a face mask mold), choose
+**Inside**. The flange follows that face along the whole cut and stops flush and square at the
+mold's edge. Marks on the wall, such as a raised pad, a label or an engraved line, are fine: they
+count as part of the face they are on.
+
+If the mold's edge is rounded, Flange Cutter may not find it. Then step 1 shows the warning "Flange
+Cutter could not find the edge of this mold", and the flange side is chosen piece by piece along
+each cut. Check the flange in the preview, especially near the edge of the mold: it should stay on
+the face you chose.
 
 ### Step 4: Bolts and flange
 
@@ -119,7 +135,8 @@ The mold face on the other side stays clean.
 - **Bolts**: choose **Number of bolts** (click **Suggest** for about one bolt every 50 mm), or
   **Spacing**, the distance between bolts in mm.
 - **Fastening**:
-  - **Through-bolt and nut**: a washer and a nut on the other side. You need a tool on both sides.
+  - **Through-bolt and nut**: a washer under the bolt head, and a washer and a nut on the other
+    side. You need a tool on both sides.
   - **Nut pocket**: a hexagonal pocket in one flange holds the nut, so you need only one tool.
     Choose which part gets the pockets: **Arrow side** or **Other side**.
 - **Flange thickness**, **Flange width** and **Hole diameter**: leave them empty for the automatic
@@ -174,7 +191,7 @@ Under the panel, the 2D cut view shows the selected cut, seen from the arrow sid
 | Line through the holes | The bolt line. A dashed part has no room for bolts (another cut is too close). |
 | Red bolt | A tool cannot reach this bolt: the wall is in the way. |
 | Colored dashed line, "Cut 1 crosses here" | Another cut crosses this one. No bolts near it. |
-| "mold cavity" | The inside of the mold. The flange never grows into it. |
+| "mold cavity" | The inside of the mold. With **Outside**, the flange never grows into it. With **Inside**, the flange grows from the inner face into the cavity. |
 
 ## Warnings and errors
 
@@ -185,13 +202,15 @@ Each warning says what to do. The most common ones:
 | The model has holes | The STL is not a closed solid. | Repair it in your slicer, export it again, open it again. |
 | The model is only … mm / … mm across | Probably the wrong unit. | Scale it to millimeters, then open it again. |
 | The model had small errors… fixed | Flange Cutter repaired it. | Nothing. Check the parts in your slicer. |
+| Flange Cutter could not find the edge of this mold | The edge may be rounded. Flange Cutter chooses the flange side piece by piece along each cut. | Check the flange in the preview, especially near the edge of the mold. |
 | Cut N does not go through the model | The cut misses the model. | Drag the cut onto the model, or delete it. |
 | Too many bolts. At most … fit | The bolts would be too close together. | Lower the number of bolts, or click Suggest. |
 | Some bolts are only … mm apart | Bolts very close together. | Lower the number of bolts or use a smaller bolt. |
-| The wall meets the cut at up to …° | The cut crosses the wall at a slant. | Turn the cut so it crosses the wall more squarely. |
+| The wall meets the cut at up to …° | The cut crosses the wall at a slant. Where the wall is almost parallel to the cut, the flange may not cover the whole wall face. | Turn the cut so it crosses the wall more squarely. |
 | The wall flares over the flange, bolt line moved out | The wall leans over the bolts. | Nothing. The flange is wider than usual. |
 | The wall blocks the tool space at bolt … | A tool may not reach these bolts. | Move or turn the cut, or check you can reach them. |
 | The washer does not fit on the flange | The flange is too narrow there. | Make the flange wider, or move the cut. |
+| The washer does not fit… / Part X is not held by any bolt, on a cut near the mold's edge | The mold's edge is closer to the cut than the flange thickness. The flange there gets shorter or thinner, so that it ends at the edge. | Move the cut away from the edge of the mold. |
 | No room for bolts … because cut N is too close | Two cuts are too close together. | Move the cuts apart. |
 | Cut N is too close to cut M / crosses at only …° | Their flanges would merge. | Move them apart, or make them cross at 30° or more. |
 | Each separate stretch of the cut needs 2 bolts | You asked for fewer bolts than the cut needs. | Nothing. |

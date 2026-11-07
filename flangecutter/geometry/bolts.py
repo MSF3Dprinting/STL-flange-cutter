@@ -90,8 +90,6 @@ PARAMS: tuple[Param, ...] = (
           "Flange material outside the washer."),
     Param("hole_clearance", "Extra hole size", "mm", 0.0, 1.0, 0.2,
           "Added to the ISO hole size so the bolt fits through a printed hole."),
-    Param("overlap", "Overlap into wall", "mm", 0.2, 2.0, 0.6,
-          "How far the flange reaches into the wall, so wall and flange print as one part."),
     Param("max_wall_angle", "Wall angle limit", "deg", 0.0, 60.0, 25.0,
           "Warn when the wall meets the cut more than this far from square."),
     Param("tool_clearance", "Tool clearance", "mm", 0.0, 40.0, 12.0,
@@ -116,7 +114,6 @@ class Derived:
     wall_gap: float
     edge: float
     hole_d: float
-    overlap: float
     max_wall_angle: float
     tool_clearance: float
     end_margin: float
@@ -211,7 +208,7 @@ def derive(bolt_name: str, fastening_key: str, params: dict) -> Derived:
                                 "Make the holes smaller, or use a bigger washer."))
     return Derived(bolt=bolt, fastening=fastening, thickness=float(thickness), width=p["width"],
                    wall_gap=p["wall_gap"], edge=p["edge"], hole_d=float(hole_d),
-                   overlap=p["overlap"], max_wall_angle=p["max_wall_angle"],
+                   max_wall_angle=p["max_wall_angle"],
                    tool_clearance=p["tool_clearance"], end_margin=p["end_margin"],
                    grip=grip, bolt_length=length, pocket_af=af, pocket_depth=depth, warnings=warnings)
 

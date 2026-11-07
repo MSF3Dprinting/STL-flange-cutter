@@ -14,3 +14,6 @@ flange-cutter-starter.zip
 out/
 .DS_Store
 Thumbs.db
+
+# Real molds made from patient scans: never commit them
+data/
