@@ -145,14 +145,41 @@ Per cut, in that cut's plane coordinates (`cutter.section` and `cutter.layout`):
    - A thin region that touches surfaces of one side only (all outward or all inward) belongs to
      the largest of them (the walls of a pad, the walls and floor of an engraved line). One that
      touches both sides is **rim**, also when it is made of several facets.
-   - A body with outward and inward surfaces joined by rim is a **thin shell**. Every other body is
-     labeled **OTHER**, and the cutter uses the POC's per-segment rule there (step 3).
+   - A body with outward and inward surfaces joined by rim is a **thin shell**, if its two sides
+     differ in area by at most 2 times (the two faces of a thin wall have about the same area).
+     Every other body is labeled **OTHER**, and the cutter uses the POC's per-segment rule there
+     (step 3).
+   - **Second look** (`mesh_io.wall_end`, decision 54). Where the mold's edge is rounded (the normal
+     turns over in steps under 45°) or ends in a knife edge (the two faces meet at one sharp edge,
+     with no rim between them), the outer and inner side come out as one surface, and the body as
+     OTHER. So the faces are also grouped a second time, with the **wall's end** as extra patch
+     borders. The wall direction at a face is the main axis of the face normals (weighted by area)
+     in the 2 × 2 × 2 cells of two wall thicknesses nearest to the face: both faces of the wall
+     point along it, one each way. Long triangles are first cut into pieces of at most one cell,
+     so that every cell sees the surface that is in it. A face more than 60° off the wall direction
+     is the wall's end (the rim, or the middle of a rounded edge). So are both faces of an edge
+     where the normal crosses from one side of the wall to the other while both stay within 60° of
+     the wall direction (a knife edge), read against the first face's wall direction, and against
+     the second face's own where the two directions are clearly one axis (at a square bend of the
+     wall they are square to each other, and their sign is rounding noise). An edge between a face
+     of the wall's end and one that is not parts patches; everything else is as above.
+   - **Which look** (`mesh_io._choose`, decision 56), per body (connected part of the mesh): the
+     first look, unless it labeled the body OTHER, or both looks found a shell but put more than
+     0.1 % of the body's area on opposite sides, outward in one and inward in the other (a rounded
+     stretch joined part of one face to the other, and a pad or an engraved line made the rest still
+     look like a shell). On every mold that the first look labels right (the four real molds of
+     1.0.1, the test molds with a square edge, plain CAD cups), the two looks put no face on
+     opposite sides at all; faces that only change between a surface and the rim do not count,
+     because the second look is less sure at sharp bends of the wall. A body that the first look
+     labeled keeps exactly its labels when the second agrees. `Model.edge` (written to the log) says how
+     the edge was found: `sharp`, `found from the wall direction`, `not found` or `none` (no thin
+     shell, for example a solid block).
    - `Model.surfaces` holds every face's label (a surface id, `RIM` or `OTHER`); `Model.outside`
      holds the ids of the outward surfaces.
-   - A thin-walled body (wall thickness under 0.1 × its smallest extent) that comes out OTHER gives
-     the warning `edge_not_found`: "Flange Cutter could not find the edge of this mold (it may be
-     rounded). It chooses the flange side piece by piece along each cut." Action: "Check the flange
-     in the preview, especially near the edge of the mold."
+   - A thin-walled body (wall thickness under 0.1 × its smallest extent) that comes out OTHER in
+     both looks gives the warning `edge_not_found`: "Flange Cutter could not find the edge of this
+     mold, so it cannot tell the two faces apart. It chooses the flange side piece by piece along
+     each cut." Action: "Check the flange in the preview, especially near the edge of the mold."
 2. **Section**: `Manifold.slice(0)` gives the wall section; `trimesh.intersections.mesh_plane`
    gives the same outline as segments, each with the mesh face behind it (its normal, how far the
    wall leans, and its label). Both are also taken at z = ±T/2 and ±T (T is the flange thickness
@@ -160,7 +187,9 @@ Per cut, in that cut's plane coordinates (`cutter.section` and `cutter.layout`):
    there, and the mold's edge may lie elsewhere, or the wall may not reach that far.
 3. **Flange side**: "Outside" gives the flange to every segment of the outward surfaces, "Inside"
    to every segment of the inward surfaces, along the whole cut. The other side of the wall is the
-   **protected face**. Rim segments never get flange: they are guarded like the protected face.
+   **protected face**. Rim segments get no flange (they are guarded like the protected face),
+   except a sliver of rim shorter than the wall thickness between faces of the flange side on a
+   thin shell (step 4).
    For OTHER faces the POC's rule applies (decision 13): per connected region of the section the
    reference point is the centroid of its convex hull, and a segment faces away from the cavity
    when its normal points away from that point ("Outside" uses those segments, "Inside" the
@@ -185,14 +214,26 @@ Per cut, in that cut's plane coordinates (`cutter.section` and `cutter.layout`):
      layer loses the guard bands at both of its faces. On a half with wedge fill the protected face
      moves away from the flange as the height grows, so the outer layer reaches further into the
      wall than the inner one.
+   - **Label noise along the outline** (`_fill_gaps`, thin shells only): a guard run shorter than the
+     wall thickness with flange on both sides (a sliver of rim between faces of the flange side,
+     where the edge is rounded or knife-edged) goes to the flange side. A real crossing of the edge
+     has flange on one side and the protected face on the other. On OTHER faces the guard side comes
+     from the proof of concept's rule, and a groove there is a real protected face.
    - **End cuts** (`_end_cuts`, `_uncovered`), per flange chain and per layer face (z = 0, ±T/2,
      ±T). (1) Along stretches of the chain with no wall within W + 2 mm at that height, the chain's
      bands are cut away: the mold's edge is lower there, so a layer at that height would stand past
      it. (2) At every end of a flange chain at that height that meets a guard chain (the rim; on
-     OTHER models the face where the flange side flips), the guard chain is carried on past the end
-     by 3W + 2 mm. Its guard band, 3W + 2 mm wide, is cut away from the bands of the chain at the
-     cut nearest to that end. That far, because where the face meets the edge at a shallow angle the
-     flange band crosses the edge line far from the end. Each cut trims its own chain's bands only.
+     OTHER models the face where the flange side flips; where crumbs under 1 mm lie between them,
+     the guard chain ending within 1.5 mm), the guard chain is carried on past the end by 3W + 2 mm
+     (decision 55). Where the rim there is a full crossing (at least ¾ of the wall thickness and
+     1 mm, not folding back: a square or slanted rim, also cut at a slant), and on OTHER guard
+     chains, along the line from 1 mm back along the guard chain, as in 1.0.1.
+     Elsewhere on a thin shell (a rounded or knife edge, a ridge where the edge's shape changes, a
+     layer's height clipping a rim's corner) square across the wedge between the flange face
+     arriving at the end and the protected face after the rim. The guard band along the carried-on
+     guard chain, 3W + 2 mm wide, is cut away from the bands of the chain at the cut nearest to that
+     end. That far, because where the face meets the edge at a shallow angle the flange band
+     crosses the edge line far from the end. Each cut trims its own chain's bands only.
      So the flange ends flush with the mold's edge at every height where a layer ends, also where
      the edge meets the cut or the face at a slant. Where the edge is closer to the cut than the
      flange half's thickness, the layers that reach past it get no flange there. The flange is then
@@ -268,6 +309,52 @@ Then, once for all cuts (`cutter.generate`):
   the POC's per-segment rule flips sides and breaks the flange into pieces on both faces. A
   surface's side comes from the way it faces, not from its size: a raised pad or label on the
   outer side faces outward too, and two joined cups have two inward surfaces.
+- **One rounded stretch of the edge is enough to lose the whole mold.** Sharp edges alone cannot
+  part the two faces where the edge is rounded or ends in a knife edge: on two real face masks the
+  edge was rounded along 6 and 14 % of its length, in steps of 10 to 40°, and there were 4 and 7
+  knife-edge spots, so both molds came out OTHER and the flange broke into pieces on both faces.
+  A crease angle of 10° instead of 45° happened to label those two, but a finer round has smaller
+  steps. The second look (step 1) finds both at any tessellation.
+- **The first look can be fooled, not only fail.** With a rounded stretch of the edge, a raised pad
+  on the inner face or an engraved line on the outer one still left two "sides" and a "rim", and
+  the first look found a shell with part of one face on the wrong side (review). The area test
+  catches the pad, only the comparison with the second look catches the line: hence both looks
+  for every body (step 1), not the second only where the first fails.
+- **Wall directions need surface pieces, not face centres.** A long triangle (a CAD-like mesh has
+  one per 60 mm of wall) put all of its area at its centre, so the cells at the mold's edge did not
+  see the wall: on a test cup the wall direction at the rounded edge was wrong at most faces, and
+  the cup came out OTHER (with the points' covariance, tried first, a third of the cup became
+  "wall's end"). `_split_long` cuts triangles to at most one cell (two wall thicknesses) first.
+- **The knife-edge rule needs both faces clearly on a side.** A rim face's normal is square to the
+  wall direction, so the sign of n · m is noise there; counted as a fold, every rim grew by a row of
+  side faces. Both faces must be within 60° of the wall direction (one each way). Read the second
+  face against both wall directions: where the edge changes its shape they differ, and one sharp
+  edge between a slanted rim and a round slipped through both rules and lost the mold (review). But
+  only where the two directions are clearly one axis: at a square bend of the wall they are square
+  to each other, the sign of m · m is rounding noise (10⁻¹⁸), and it drew stripes of rim on plain
+  CAD cups, taking two thirds of a cut's flange (review). Keep one shared block axis per face
+  pair: a face that kept its own normal where it is strong in the block fixed sharp box corners
+  but hid the knife edges of both real masks.
+  Knife-edge folds need not be convex: a third of those of one real mask were concave, and a
+  convex-only rule lost that mold.
+- **The normals' main axis, not the points' flattest axis.** The points' covariance also finds the
+  wall's direction on a plain wall, but at the end of the wall (a half slab) and on rounded edges it
+  missed some of the edge on both real masks; the normal tensor found all of it.
+- **A 1 mm line only follows a full rim crossing.** The end cut's line from 1 mm back along the guard
+  chain is the edge line of a square or slanted rim, which spans the whole wall. Across a round it
+  left 18 mm³ of flange (0.5 mm high) above the top of the test tube. Over the two faces of a knife
+  edge it turned up to 74° from the edge line, upward or downward with a shift of the cut by
+  0.8 mm: 145 mm³ above the top, or half the flange missing. Onto the protected face where the
+  faces meet without rim (the blends between the tube's stretches) it turned up to 53°, and up to
+  220 mm³ stood above the top. Cut square across the wedge there (step 4). A rim run's
+  shape does not tell a knife tip from a crossing that curves: both measured 0.73 to 0.91 (chord
+  over path), but a knife's two fold faces are about 1 mm, a full crossing at least the wall's
+  thickness. The rim faces' mean normal was no better: they cover a fold unevenly (up to 74° off).
+- **A sliver of rim between faces of the flange side splits the flange.** The flange chain then
+  ends at the sliver, a short island of flange lies beyond it, and each end cut trims only the
+  chain nearest to it: the island's band stood past a knife edge (327 mm³ on a test mask).
+  `_fill_gaps` gives such slivers to the flange side, on thin shells only: on a solid block it
+  filled a channel of the protected side with flange (review).
 - **Leaning walls need layers.** A straight slab next to a leaning wall pokes through the
   protected face unless every layer is trimmed by the guards at both of its faces. Where the wall
   leans away from the flange, a slab that only touches the wall leaves a wedge-shaped gap, and one
@@ -317,8 +404,33 @@ Then, once for all cuts (`cutter.generate`):
   more squarely."
 - **The mold's edge is checked at five heights only** (z = 0, ±T/2 and ±T, where the layers end).
   An edge that bulges toward the cut between them can leave a small overhang.
-- **Rounded edge**: no rim is found, so the body is OTHER. The warning `edge_not_found` appears
-  (step 1), and the flange side is chosen piece by piece.
+- **No edge found**: a thin-walled body that neither look labels as a thin shell is OTHER: a closed
+  hollow model (no rim at all), or two cavities joined where one has a rounded and the other a
+  square edge (a test case: the second look finds a rim, but one side has 3 times the area of the
+  other). The warning `edge_not_found` appears (step 1), and the flange side is chosen piece by
+  piece.
+- **A slanted rim can count as part of the face it leans toward.** A rim slanted 45° or more from
+  square meets that face at a smooth edge. On a mold that needs the second look, a rim slanted 30°
+  or more is not the wall's end either (its normal is within 60° of the wall direction), so it
+  joins that face where it runs into a rounded or knife-edged stretch of the edge; the wall
+  direction tilts there too, and on the test tube 23 to 25° was enough. A rim slanted less than 45°
+  all round, or between square stretches, stays rim (30° and 35° bevels did). With the flange on
+  that face, the flange covers the slanted rim and can stand past the edge: about 220 mm³ above the
+  top of a test bowl with a 45° bevel all round (1.0.1 left 520 mm³ there). The real molds have
+  square rims with rounded or knife-edged spots.
+- **A narrow fin on a mold that needs the second look** (a ridge whose channel on the other face has
+  a tip radius under about 1.8 mm, test mold only): part of the channel can come out as the other
+  face (540 mm² there): an Inside cut through the fin covered 19 % of its face, and an Outside cut
+  put 45 mm³ of flange into the channel.
+- **Sharp 90° bends of the wall on a mold that needs the second look** (a box or tray whose edge is
+  rounded in places): within about one wall thickness of the bend the block of cells holds both
+  walls alike, and those faces can come out as rim. Molds the first look labels are not touched.
+- **An engraved line within about 3.5 mm of a rounded edge** (about one and a half wall
+  thicknesses) can still fool the first look: the second look calls the narrow strip above the
+  line rim, not outer face, so the looks do not put it on opposite sides, and the first look stays.
+  Further from the edge it is caught (decision 56).
+- **A rim crossing that curves** (on one of the real molds whose edge is rounded in places) can
+  leave a sliver of flange up to about 2 mm past the edge: 9 mm³ on one of its 24 cuts.
 - **No wedge fill within W of the mold's edge**: there, only the 0.6 mm strip reaches into the
   wall.
 - **A cut closer to the mold's edge than the flange half's thickness** gets a shorter or thinner
@@ -347,6 +459,14 @@ tilted transverse cut of the speed test (`tests/test_geometry.py`, 102,000 trian
 bolt line moves out twice, takes about 0.16 s to preview and 0.8 s to generate. On the four real
 face-mask molds (120,000 to 241,000 triangles) the preview took 0.39 s (median) and at most 0.87 s,
 on a busy laptop (validation run 8).
+
+Version 1.0.2 opens a model with both looks at the surfaces (decision 56). Measured back to back
+with 1.0.1 on 2026-11-19 (median of 3, the same laptop, busy): 32,000 triangles 0.41 s (0.15),
+195,000 triangles 2.8 s (2.5), two real molds of 199,000 and 241,000 triangles 3.1 s (2.6) and
+4.9 s (3.3), a real mold of 756,000 triangles 16.2 s (11.9). Preview and Generate do the same work
+as in 1.0.1 apart from the end cuts and the label-noise fill (`_fill_gaps`, about 8 % of a preview
+on two real molds); on the six real molds the preview took 0.81 s (median) and at
+most 3.0 s on that laptop (validation run of 1.0.2).
 
 Each cut's section is cached on the model, so moving one cut recomputes only that cut's section;
 the other cuts are laid out again from their cached sections. The page shows a progress bar during

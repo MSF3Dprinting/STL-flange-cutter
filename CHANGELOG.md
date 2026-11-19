@@ -2,6 +2,29 @@
 
 All notable changes to Flange Cutter. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.0.2 (2026-11-19)
+
+Fixes from the second test with real face-mask (TFO) molds.
+
+- Molds whose edge is rounded in places, or ends in a sharp knife edge, are now cut correctly.
+  Before, Flange Cutter could not tell the two faces of such a mold apart: the flange came in
+  pieces, partly on the wrong face and past the mold's edge, some cuts said "too many bolts", and
+  a part could come out not watertight. Now it also finds the edge from the direction of the wall, so the
+  flange follows one face and stops at the edge, as on molds with a square edge. Molds that already
+  worked see their two faces and their edge exactly as before.
+- Where a flange ends at a rounded or knife edge, or where the edge changes its shape, the flange
+  now stops flush with the edge. It used to stand past it, sometimes by several millimeters. On a
+  square edge the flange ends as before.
+- On a mold with a rounded edge, a raised pad on the inner face no longer makes part of one face
+  count as the other. Neither does an engraved line on the outer face, unless it runs within about
+  3.5 mm (one and a half wall thicknesses) of the rounded edge.
+- A mold with a fully rounded edge no longer gets the warning "Flange Cutter could not find the
+  edge of this mold". The warning now appears only when Flange Cutter still cannot tell the two
+  faces of the mold apart, for example on a closed hollow model, which has no edge at all.
+- Opening a model takes a little longer (about 1 second more for 200,000 triangles), because
+  Flange Cutter now looks at the mold's faces in two ways. The log file says how the mold's edge
+  was found, to help support.
+
 ## 1.0.1 (2026-11-07)
 
 Fixes from the first test with real face-mask (TFO) molds.

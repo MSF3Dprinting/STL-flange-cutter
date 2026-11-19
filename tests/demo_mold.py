@@ -2,8 +2,10 @@
 
 samples/demo_mold.stl was exported from the POC with the default resolution (about 32k triangles).
 """
+import math
+
 import numpy as np
-from manifold3d import CrossSection, Manifold
+from manifold3d import CrossSection, Manifold, Mesh
 
 from flangecutter.geometry.mesh_io import stl_bytes
 
@@ -73,13 +75,83 @@ def mask_with_marks(seg=128):
     return mask_mold(seg=seg) + pad - line
 
 
-def rounded_cup(seg=160):
-    """A cup 80 mm across and 60 mm high, 2.5 mm walls and bottom, whose top edge is rounded: no sharp
-    edge separates its outer and inner faces, so they cannot be told apart."""
-    profile = [(0.0, 0.0), (40.0, 0.0), (40.0, 60.0)]
-    profile += [(38.75 + 1.25 * np.cos(a), 60 + 1.25 * np.sin(a)) for a in np.linspace(0, np.pi, 25)[1:-1]]
-    profile += [(37.5, 60.0), (37.5, 2.5), (0.0, 2.5)]
+def rounded_cup(seg=160, height=60.0):
+    """A cup 80 mm across and `height` high (60 mm), 2.5 mm walls and bottom, whose top edge is rounded:
+    no sharp edge separates its outer and inner faces."""
+    profile = [(0.0, 0.0), (40.0, 0.0), (40.0, height)]
+    profile += [(38.75 + 1.25 * np.cos(a), height + 1.25 * np.sin(a)) for a in np.linspace(0, np.pi, 25)[1:-1]]
+    profile += [(37.5, height), (37.5, 2.5), (0.0, 2.5)]
     return CrossSection([np.array(profile)]).revolve(seg)
+
+
+MIXED_EDGE = {"square": (0, 160), "rounded": (180, 250), "knife": (270, 340)}   # degrees around the tube
+
+
+def mixed_edge_tube(r=60.0, wall=2.35, height=50.0, rings=180, cap=9, step=2.0, spans=None, lean=30.0):
+    """A tube (open at both ends) whose top edge changes its shape around the tube, like the edge of
+    the real molds that 1.0.1 could not label: square from 0 to 160 deg, rounded in 22.5 deg steps (a
+    half-round of the wall's thickness) from 180 to 250 deg, a knife edge from 270 to 340 deg (both
+    faces lean in over the last 4 mm and meet at a sharp ridge), with smooth blends between. The
+    bottom edge is square. Every top shape reaches z = height. Outer radius r, inner r - wall.
+    `spans` ({kind: (from, to) deg}) changes the layout; the kind "bevel" is a flat rim that leans
+    `lean` deg from square toward the inner face."""
+    spans = spans or MIXED_EDGE
+
+    def top(kind):
+        """(cap points from the outer face to the inner face, height where the walls stop)."""
+        u = np.linspace(0.0, 1.0, cap)
+        if kind == "square":
+            return np.c_[r - wall * u, np.full(cap, height)], height
+        if kind == "bevel":
+            drop = wall * math.tan(math.radians(lean))
+            return np.c_[r - wall * u, height - drop * u], height - drop
+        if kind == "rounded":
+            a = np.pi * u
+            return np.c_[r - wall / 2 + wall / 2 * np.cos(a), height - wall / 2 + wall / 2 * np.sin(a)], height - wall / 2
+        tip, half = np.array([r - wall / 2, height]), cap // 2       # knife: up to the tip, then down
+        lo_o, lo_i = np.array([r, height - 4.0]), np.array([r - wall, height - 4.0])
+        up = lo_o + np.linspace(0, 1, half + 1)[:, None] * (tip - lo_o)
+        down = tip + np.linspace(0, 1, cap - half)[1:, None] * (lo_i - tip)
+        return np.vstack([up, down]), height - 4.0
+
+    def weights(deg):
+        """How much of each top shape a ring at this angle has (linear blends in the gaps)."""
+        order = list(spans.items())
+        for kind, (a0, a1) in order:
+            if a0 <= deg < a1:
+                return {kind: 1.0}
+        for (k0, (_, a1)), (k1, (b0, _)) in zip(order, order[1:] + order[:1]):
+            gap_end = b0 if b0 >= a1 else b0 + 360
+            d = deg if deg >= a1 else deg + 360
+            if a1 <= d < gap_end:
+                f = (d - a1) / (gap_end - a1)
+                w = {k0: 1.0 - f}
+                w[k1] = w.get(k1, 0.0) + f
+                return w
+        return {"square": 1.0}
+
+    n_wall = int(round(height / step))
+    profiles = []
+    for deg in np.arange(rings) * 360.0 / rings:
+        pts, z_top = 0.0, 0.0
+        for kind, w in weights(deg).items():
+            p, z = top(kind)
+            pts, z_top = pts + w * p, z_top + w * z
+        z = np.linspace(0.0, z_top, n_wall + 1)[:-1]
+        bottom = np.c_[r - wall + wall * np.array([1, 2]) / 3, [0.0, 0.0]]
+        profiles.append(np.vstack([np.c_[np.full(n_wall, r), z], pts, np.c_[np.full(n_wall, r - wall), z[::-1]][:-1],
+                                   [[r - wall, 0.0]], bottom]))
+    prof = np.array(profiles)                                            # (rings, points, 2): (radius, z)
+    th = np.arange(rings) * 2 * np.pi / rings
+    v = np.stack([prof[..., 0] * np.cos(th)[:, None], prof[..., 0] * np.sin(th)[:, None], prof[..., 1]], axis=-1)
+    k, i = np.meshgrid(np.arange(rings), np.arange(prof.shape[1]), indexing="ij")
+    idx = lambda kk, ii: (kk % rings) * prof.shape[1] + ii % prof.shape[1]
+    a, b, c, d = idx(k, i), idx(k, i + 1), idx(k + 1, i + 1), idx(k + 1, i)
+    f = np.r_[np.c_[a.ravel(), b.ravel(), c.ravel()], np.c_[a.ravel(), c.ravel(), d.ravel()]]
+    m = Manifold(Mesh(vert_properties=v.reshape(-1, 3).astype(np.float32), tri_verts=f.astype(np.uint32)))
+    if m.volume() < 0:
+        m = Manifold(Mesh(vert_properties=v.reshape(-1, 3).astype(np.float32), tri_verts=f[:, ::-1].astype(np.uint32)))
+    return m
 
 
 def cone_shell(lean=50.0, wall=2.35, length=45.0, r=70.0, seg=128):

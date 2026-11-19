@@ -7,8 +7,10 @@ date, the machine and who checked.
 standard user account **without admin rights**, Python 3.12.10. Version 1.0.0 was checked on
 2026-11-06 with its installer and portable ZIP. Version 1.0.1 was checked on 2026-11-07 with the
 portable ZIP, the only package since 1.0.1 (decision 46), built with `build\build_windows.ps1`
-(unsigned). Most checks were run by script; the evidence is in the commit messages and
-`docs/DECISIONS.md`. Everything not ticked is still **open**.
+(unsigned). Version 1.0.2 was checked on 2026-11-19 by the automatic tests and the real-mold run of
+A10, and with its portable ZIP (unsigned, smoke-tested by the build script): the unzipped app
+opened both field molds of A10 without warnings and cut them on both flange sides. Most checks were run by script; the evidence is in the commit
+messages and `docs/DECISIONS.md`. Everything not ticked is still **open**.
 
 ## A. Spec checklist (section 8)
 
@@ -107,6 +109,46 @@ portable ZIP, the only package since 1.0.1 (decision 46), built with `build\buil
   - **Preview:** median 0.39 s, at most 0.87 s (busy laptop).
 - [ ] **By hand:** the owner's own cuts on these molds, both flange sides: the flange is where it
   should be, the preview is quick enough, and the parts print.
+
+### A10. Real face-mask molds with rounded and knife-edged spots (1.0.2)
+
+- [x] Two more real TFO molds from the field (`data/`, kept out of git), 199,000 and 756,000
+  triangles, 2026-11-19, whose edge is rounded along 14 and 6 % of its length and knife-edged at 7
+  and 4 spots; plus the four molds of A9 again. 11 jobs per mold (the kinds of A9, plus the first
+  cut the page proposes), each with Outside and Inside: 132 jobs. The planes follow each mold's own
+  axes, so on two molds of A9 every cut but the coronal one differs from A9's, and the three random
+  planes are new on all four. On one mold of A9 the cut 25 mm from the nose misses the mold (with
+  1.0.1 too), so 130 jobs give parts. Probes are judged against labels found independently (a 10°
+  crease angle, checked by hand to separate both faces of these two molds).
+  - **The four molds of A9:** the same results as 1.0.1 on every job (the same labels, the same
+    flange outlines).
+  - **Labels:** both new molds load as one thin shell (edge found from the wall direction), without
+    warnings. 1.0.1 labeled both as OTHER, with the warning `edge_not_found`.
+  - **Parts:** all valid after STL export and reload. With 1.0.1 one part was not watertight.
+  - **Mold face clean:** at most 0.5 % of the probes (1.0.1: up to 88 %). The 0.5 % are two cuts of
+    the 199,000-triangle mold: an Inside cut and an Outside cut. On the Inside cut, flange material
+    sits on the protected face at one spot about 1 mm across and about 0.5 mm thick (at most
+    1.3 mm), where the face has a tiny sharp feature, 73 mm from the edge. On the Outside cut, flange
+    about 1 mm thick lies on the protected face right beside the edge, over about 3 by 1 mm. The
+    1.0.1 cutter does the same on both cuts, with the reference labels and with 1.0.2's labels
+    (open, see below).
+  - **Flange joined to the wall:** median 95 % and 99 % of the flange face covered, at least 87 %
+    and 95 % (1.0.1: 75 and 93 %, down to 0 and 32 %). The two cuts under 90 % get 84 and 88 % with
+    the reference labels too. One flange piece per wall on 47 of the 48 cuts (1.0.1: up to 15 pieces);
+    the last has three crumbs of 0.1 to 3.7 mm² beside the flange of a short wall crossing, joined
+    to the part.
+  - **Past the mold's edge** (the quick test of A9): at most 8.8 mm³ and 0.0 mm³ (1.0.1: 2,244 and
+    1,031 mm³); 1 to 9 mm³ on 7 of the 48 cuts. The largest is a sliver at a curved rim crossing;
+    the exact test also finds about 8 mm³ there. On the molds of A9 the quick test finds up to
+    11.1 mm³, as with 1.0.1: that is A9's worst cut (14 mm³ there: the quick test samples at
+    random), where the exact test leaves under 2 mm³. The share of rim probes in flange material is
+    up to 12.5 %, but those reference rim faces include the shoulders of the rounded spots, beside
+    which the flange belongs.
+- [ ] **By hand:** the field user's own cuts on these two molds, both flange sides, printed and
+  assembled.
+- [ ] **Open:** the flange material on the protected face on two cuts of the 199,000-triangle mold
+  (a spot on an Inside cut, a small patch beside the edge on an Outside cut; also with 1.0.1's
+  cutter): check them in the slicer, and look at them in the code if they show.
 
 ## B. Other checks that could not be done on the development laptop
 

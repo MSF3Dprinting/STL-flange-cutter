@@ -95,7 +95,7 @@ def create_app(session: Session | None = None) -> Flask:
             finally:
                 s.set_progress("", 0.0, busy=False)
         mid = s.add_model(model)
-        log.info("opened %s (%d triangles)", f.filename, len(model.mesh.faces))
+        log.info("opened %s (%d triangles, mold edge: %s)", f.filename, len(model.mesh.faces), model.edge)
         return jsonify(model.info() | {"model_id": mid})
 
     @app.get("/api/model/<mid>/mesh.stl")

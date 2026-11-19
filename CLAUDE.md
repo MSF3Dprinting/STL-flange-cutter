@@ -12,7 +12,7 @@ py -3.12 -m venv .venv   # or: & "$env:LOCALAPPDATA\Programs\Python\Python312\py
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m playwright install chromium     # once, for the UI test
 .\.venv\Scripts\python.exe -m flangecutter                    # run the app (--no-browser, --port N)
-.\.venv\Scripts\python.exe -m pytest tests -q                 # all tests (about 1-2 minutes)
+.\.venv\Scripts\python.exe -m pytest tests -q                 # all tests (about 3 minutes)
 .\.venv\Scripts\python.exe -m pytest tests -q -m "not ui"     # without the browser test
 powershell -ExecutionPolicy Bypass -File build\build_windows.ps1   # portable ZIP into build\out (no installer)
 ```
@@ -31,7 +31,7 @@ them to a temporary folder).
 - `flangecutter/static/`: `index.html`, `app.css`, `js/{main,viewer,panel,cutview,api}.js`,
   `vendor/three/` (three.js r187, never edit).
 - `tests/`: `test_geometry.py`, `test_api.py`, `test_ui.py`, `demo_mold.py` (test molds: POC cup,
-  face mask, mask with marks, cone, rounded cup).
+  face mask, mask with marks, cone, rounded cup, mixed-edge tube).
 - `reference/`: the proof of concept. **Never change these files.**
 - `data/*.stl`: real molds made from patient scans, git-ignored. **Never commit, copy or print
   them**; report only aggregate numbers from them.
@@ -66,7 +66,17 @@ them to a temporary folder).
 - A flange face must never lie on a mold face (slivers after export): the guard keeps 0.1 mm
   (`GUARD_GAP`).
 - Flange end cuts (`_end_cuts`) trim only their own chain's bands; never prolong guard chains
-  globally (across a narrow opening that once erased a whole flange, decision 43).
+  globally (across a narrow opening that once erased a whole flange, decision 43). The 1.0.1 line
+  (1 mm back along the guard chain) only on full rim crossings and OTHER chains; on a thin shell
+  elsewhere cut square across the wedge (decision 55). Short guard runs between flange runs are
+  label noise on thin shells (`_fill_gaps`, never on OTHER: real grooves there): left in, they split
+  off flange islands that no end cut trims.
+- Surface labels: two looks for every body (sharp edges; plus the wall's end from `wall_end`,
+  decision 54), chosen per body by `_choose` (decision 56): a body the first look labeled must
+  keep its labels when the second agrees. Wall directions from the normal tensor of split triangle
+  pieces (not face centres, not point covariance); a knife edge only between faces clearly on a
+  side, read against both faces' wall directions (the second only where they are one axis: at a
+  square bend their sign is noise), convex or not. `_choose` compares out/in flips only.
 - `stl_bytes` cleans up and merges flat meshes (a test cone: 23,552 to 1,024 triangles). Tests that
   need a mesh's own triangles write it with `mesh_io.to_trimesh(m).export(file_type="stl")`.
 - Validation probes: keep a probe only where the probe itself (not its face center) lies within

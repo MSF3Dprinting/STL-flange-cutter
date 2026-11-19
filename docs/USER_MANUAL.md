@@ -1,6 +1,6 @@
 # Flange Cutter user manual
 
-Version 1.0.1
+Version 1.0.2
 
 ## What Flange Cutter does
 
@@ -22,7 +22,7 @@ Flange Cutter comes as one ZIP file. Nothing is installed, and you do not need a
 
 **Unzip**
 
-1. Right-click `FlangeCutter-1.0.1-portable.zip` and choose **Extract All**. Pick a folder where
+1. Right-click `FlangeCutter-1.0.2-portable.zip` and choose **Extract All**. Pick a folder where
    you can save files, for example **Documents**.
 2. Open the new **FlangeCutter** folder and double-click **FlangeCutter.exe**.
 3. If Windows shows "Windows protected your PC", see the next section.
@@ -122,11 +122,14 @@ The mold face on the other side stays clean. Choose the side that is **not** the
 example, when plastic is formed over the outside of the mold (like a face mask mold), choose
 **Inside**. The flange follows that face along the whole cut and stops flush and square at the
 mold's edge. Marks on the wall, such as a raised pad, a label or an engraved line, are fine: they
-count as part of the face they are on.
+count as part of the face they are on. Only an engraved line closer than about 4 mm to a rounded
+edge can make Flange Cutter take the strip between them for the other face: check the flange in
+the preview there.
 
-If the mold's edge is rounded, Flange Cutter may not find it. Then step 1 shows the warning "Flange
-Cutter could not find the edge of this mold", and the flange side is chosen piece by piece along
-each cut. Check the flange in the preview, especially near the edge of the mold: it should stay on
+Flange Cutter finds the mold's edge also where it is rounded or ends in a sharp knife edge. Only
+if it still cannot tell the two faces of the mold apart (for example on a closed hollow model,
+which has no edge), step 1 shows the warning "Flange Cutter could not find the edge of this mold",
+and the flange side is chosen piece by piece along each cut. Check the flange in the preview, especially near the edge of the mold: it should stay on
 the face you chose.
 
 ### Step 4: Bolts and flange
@@ -202,7 +205,7 @@ Each warning says what to do. The most common ones:
 | The model has holes | The STL is not a closed solid. | Repair it in your slicer, export it again, open it again. |
 | The model is only … mm / … mm across | Probably the wrong unit. | Scale it to millimeters, then open it again. |
 | The model had small errors… fixed | Flange Cutter repaired it. | Nothing. Check the parts in your slicer. |
-| Flange Cutter could not find the edge of this mold | The edge may be rounded. Flange Cutter chooses the flange side piece by piece along each cut. | Check the flange in the preview, especially near the edge of the mold. |
+| Flange Cutter could not find the edge of this mold | It cannot tell the two faces of the mold apart (for example on a closed hollow model). It chooses the flange side piece by piece along each cut. | Check the flange in the preview, especially near the edge of the mold. |
 | Cut N does not go through the model | The cut misses the model. | Drag the cut onto the model, or delete it. |
 | Too many bolts. At most … fit | The bolts would be too close together. | Lower the number of bolts, or click Suggest. |
 | Some bolts are only … mm apart | Bolts very close together. | Lower the number of bolts or use a smaller bolt. |

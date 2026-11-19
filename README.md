@@ -38,7 +38,7 @@ use another folder. Development also works on Linux and macOS (`python3.12 -m ve
 
 ```powershell
 .\.venv\Scripts\python.exe -m playwright install chromium   # once, for the UI test
-.\.venv\Scripts\python.exe -m pytest tests -q                # everything, about 2 minutes
+.\.venv\Scripts\python.exe -m pytest tests -q                # everything, about 3 minutes
 .\.venv\Scripts\python.exe -m pytest tests -q -m "not ui"    # without the browser test
 ```
 
@@ -49,9 +49,11 @@ use another folder. Development also works on Linux and macOS (`python3.12 -m ve
   and a box (not a shell), marks on the face (a raised pad, an engraved line), the cut through the
   nose for both flange sides, the wedge fill on a leaning cone, the flange stopping at the mold's
   edge and flush with a planar edge (also where the cut meets it at a slant), no flange above the
-  top of the mold, the fill across the start of a ring, and the rounded-edge fallback (its warning,
-  and a clean protected face for both flange sides). Also the STL export's needle merge (it never
-  opens the surface). The test molds are in `tests/demo_mold.py`.
+  top of the mold, the fill across the start of a ring, a rounded edge and an edge that is square,
+  rounded and a knife edge in turn (both found from the wall direction, with clean cuts through
+  them), bodies found the first time keeping their labels, and the warning for a mold without an
+  edge. Also the STL export's needle merge (it never opens the surface). The test molds are in
+  `tests/demo_mold.py`.
 - `tests/test_api.py`: the API through Flask's test client, the single-instance lock, and the
   launcher closing another running version when the user asks.
 - `tests/test_ui.py`: Playwright with headless Chromium: open, cut, generate, download, two cuts,
@@ -131,17 +133,18 @@ build/                 build_windows.ps1 (portable ZIP), flangecutter.spec (PyIn
 ## How it works
 
 1. The STL is loaded, repaired and checked (trimesh), and turned into a Manifold solid.
-2. Every face of a thin-shell mold is labeled once, by the way it faces: outward surfaces (the
-   outer side of the wall, with any pads or labels on it), inward surfaces, or rim (the narrow band
-   along the mold's edge that joins them); any other model (a solid block, or a mold with a rounded
-   edge) keeps the proof of concept's per-segment rule. For every cut, in that cut's plane
-   coordinates, the flange is a band of the flange width along the whole cut on the outward surfaces
-   (Outside) or the inward ones (Inside), plus 0.6 mm into the wall, and more where the wall leans
-   away from the flange by more than 8°. Each half of the flange is two layers, and each layer is
-   trimmed at both of its faces: the flange stays 0.1 mm off the other face and ends flush and
-   square with the mold's edge at every layer. Bolts are spaced by arc length along a line offset
-   from the wall, kept clear of other cuts, and the bolt line moves outward when the wall would
-   block a tool.
+2. Every face of a thin-shell mold is labeled once, by the way it faces: outward surfaces (the outer
+   side of the wall, with any pads or labels on it), inward surfaces, or rim (the narrow band along
+   the mold's edge that joins them). Where the edge is rounded or ends in a knife edge, the wall's
+   end is found from the direction of the wall instead of from sharp edges. Any other model (a solid
+   block, or a closed hollow one) keeps the proof of concept's per-segment rule. For every cut, in
+   that cut's plane coordinates, the flange is a band of the flange width along the whole cut on the
+   outward surfaces (Outside) or the inward ones (Inside), plus 0.6 mm into the wall, and more where
+   the wall leans away from the flange by more than 8°. Each half of the flange is two layers, and
+   each layer is trimmed at both of its faces: the flange stays 0.1 mm off the other face and ends
+   flush and square with the mold's edge at every layer. Bolts are spaced by arc length along a line
+   offset from the wall, kept clear of other cuts, and the bolt line moves outward when the wall
+   would block a tool.
 3. Generate unites the mold with every flange slab, drills the holes and nut pockets, and only then
    splits by every plane. Each piece is checked, named A, B, C…, laid on a cut face and exported.
 
@@ -181,8 +184,17 @@ Add a test for every new option in `tests/test_geometry.py`.
 - The mold's edge is checked only at the five heights where the flange layers end (0, ±T/2 and ±T
   from the cut, T = flange thickness). An edge that bulges toward the cut between them can leave a
   small overhang.
-- A mold with a rounded edge has no rim to find: it gets the load warning `edge_not_found`, and the
-  flange side is chosen piece by piece (the proof of concept's rule, decision 13).
+- A thin-walled model whose two faces Flange Cutter cannot tell apart (for example a closed hollow
+  one, which has no edge) gets the load warning `edge_not_found`, and the flange side is chosen
+  piece by piece (the proof of concept's rule, decision 13).
+- A rim slanted 45° or more from square counts as part of the face it leans toward. So does a rim
+  slanted more than about 23° where it runs into a rounded or knife-edged stretch of the edge. With
+  the flange on that face, the flange covers the slanted rim and can stand past the edge.
+- An engraved line on the outer face within about 3.5 mm (one and a half wall thicknesses) of a
+  rounded edge can make the strip between them count as the inner face, without a warning.
+- A narrow fin on a mold whose edge is rounded in places (a ridge with a channel under about 1.8 mm
+  radius on the other face, seen only on a test mold) can get part of the channel counted as the
+  other face.
 - Within one flange width of the mold's edge there is no wedge fill, only the 0.6 mm strip into the
   wall.
 - A cut closer to the mold's edge than the flange thickness gets a shorter or thinner flange there;

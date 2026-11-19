@@ -35,7 +35,7 @@ from shapely.ops import linemerge, substring, unary_union
 from . import CutError, warning
 from .bolts import (BOLTS, COUNT_RANGE, DEFAULT_SPACING, FASTENINGS, MAX_CUTS, SPACING_RANGE,
                     SUGGEST_PITCH, Derived, check_params, derive)
-from .mesh_io import OTHER, Model, stl_bytes
+from .mesh_io import OTHER, RIM, Model, stl_bytes
 
 SIDES = ("outside", "inside")
 GAP_STEPS = 6                      # the bolt line may move out by up to 6 x 1 mm
@@ -44,6 +44,9 @@ GRID = 0.01                        # mm: flange outlines are snapped to this gri
 SIMPLIFY = 0.002                   # mm: chains are simplified this much (far under GRID) before banding
 WORKERS = max(1, min(8, os.cpu_count() or 1))   # threads for building bands (GEOS releases the GIL)
 GUARD_GAP = 0.1                    # mm: the flange stops this far from the protected face and the edge
+RIM_RUN = 0.25                     # rim crossings shorter than this many wall thicknesses count as none
+FULL_RIM = 0.75                    # ... and from this many on, a crossing that does not fold back is the edge line
+END_GAP = 1.5                      # mm: a flange chain's end meets a guard chain's end this close (crumbs)
 OVERLAP = 0.6                      # mm: the flange reaches this far into the wall everywhere (POC)
 FILL_NZ = math.sin(math.radians(8))   # walls leaning more than this get the wedge under the flange filled
 SAMPLE = 0.5                       # mm: bolt lines are checked against other cuts at this step
@@ -340,13 +343,15 @@ class Section:
     f_nz: list
     g_chains: list               # chains of the protected face and the rim (guard band)
     g_signs: list
-    levels: dict                 # z -> (guard chains, signs, wall section, flange chains) at z = +-T/2 and
-                                 # +-T, where the flange layers end: a leaning wall moves the protected
-                                 # face there, and the mold's edge may be elsewhere (or gone)
+    g_runs: list                 # per guard chain: how far it runs along the rim from its start and end
+    levels: dict                 # z -> (guard chains, signs, wall section, flange chains, rim runs) at
+                                 # z = +-T/2 and +-T, where the flange layers end: a leaning wall moves the
+                                 # protected face there, and the mold's edge may be elsewhere (or gone)
     lean_p95: float              # 95th percentile of the flange-side wall angle from square, deg
     shadow: object               # mold just beyond both flange faces, seen along the normal (tool space)
     outlines: dict = field(default_factory=dict)   # (T, W) -> _flange_outline result: a change of the
                                                    # bolts alone reuses it (it depends on nothing else)
+    wall: float = 0.0            # the model's wall thickness estimate (mm), for the end cuts
 
 
 def section(model: Model, cut: Cut) -> Section:
@@ -375,8 +380,56 @@ def _segments(model: Model, plane: Plane, dots: np.ndarray, z: float) -> tuple:
     return seg, n2, nf[:, 2], labels
 
 
+def _rim_runs(ch: LineString, tree: shapely.STRtree, rim: np.ndarray, shortest: float) -> tuple[float, float]:
+    """How far a guard chain runs along the mold's edge (rim pieces) from its start and from its end, mm.
+
+    0 where that is under `shortest`: there the section only clips a corner of the rim (seen at the
+    flange layers' heights), and the wedge rule of _end_cuts applies.
+    """
+    p = np.asarray(ch.coords)
+    length = np.linalg.norm(np.diff(p, axis=0), axis=1)
+    on = rim[tree.nearest(shapely.points((p[:-1] + p[1:]) / 2))]
+    first = len(on) if on.all() else int(np.argmin(on))           # pieces on the rim before the first off it
+    last = len(on) if on.all() else int(np.argmin(on[::-1]))
+    runs = float(length[:first].sum()), float(length[::-1][:last].sum())
+    return tuple(r if r >= shortest else 0.0 for r in runs)
+
+
+def _fill_gaps(seg: np.ndarray, mask: np.ndarray, tree: shapely.STRtree, gap: float, labels: np.ndarray) -> np.ndarray:
+    """The flange mask with every guard run shorter than `gap` that has flange on both sides filled in,
+    on thin shells only (on OTHER faces the guard side comes from the proof of concept's rule, and a
+    groove or a step there is a real protected face).
+
+    Along the section's outline, a real crossing of the mold's edge has flange on one side and the
+    protected face on the other. A short guard run between two flange runs is label noise (a sliver
+    face of the rim between faces of the flange side, where the edge is rounded or knife-edged). Left
+    in, it split the flange chain at the edge into a crumb or an island that no end cut trimmed, and
+    its band stood past the edge.
+    """
+    if gap <= 0 or mask.all() or not mask.any():
+        return mask
+    mask = mask.copy()
+    lines = linemerge(shapely.multilinestrings(shapely.linestrings(seg)))
+    for line in ([lines] if lines.geom_type == "LineString" else list(getattr(lines, "geoms", []))):
+        p = np.asarray(line.coords)
+        idx = tree.nearest(shapely.points((p[:-1] + p[1:]) / 2))          # the segment of every piece
+        length = np.linalg.norm(np.diff(p, axis=0), axis=1)
+        on = mask[idx]
+        if on.all() or not on.any():
+            continue
+        if line.is_closed:                                                 # start at a change of run
+            j = int(np.flatnonzero(on != np.roll(on, 1))[0])
+            idx, length, on = np.roll(idx, -j), np.roll(length, -j), np.roll(on, -j)
+        edges = np.flatnonzero(np.diff(np.r_[1, on.astype(int), 1]))     # guard runs: [a, b)
+        for a, b in zip(edges[::2], edges[1::2]):
+            inner = (a > 0 and b < len(on)) or line.is_closed
+            if inner and length[a:b].sum() < gap and (labels[idx[a:b]] != OTHER).all():
+                mask[idx[a:b]] = True
+    return mask
+
+
 def _split_chains(seg, n2, nz, labels, outside: tuple, regions: shapely.STRtree, refs: np.ndarray, side: str,
-                  flange_signs: bool = True) -> tuple:
+                  flange_signs: bool = True, shortest_run: float = 0.0, gap: float = 0.0) -> tuple:
     """Chains on the flange side and on the guard side, each with its outward signs (POC step 2).
 
     On a thin-walled mold every segment knows its surface (mesh_io.shell_surfaces): "outside" puts
@@ -384,11 +437,14 @@ def _split_chains(seg, n2, nz, labels, outside: tuple, regions: shapely.STRtree,
     (the mold's edge) gets none: it joins the guard side, so the flange stops square at the edge.
     Elsewhere (OTHER) the POC's rule applies: a segment faces away from the cavity when its normal
     points away from the reference point of its own region of the section.
+    Guard chains also come with how far they run along the rim from each end (_rim_runs, for _end_cuts;
+    runs under `shortest_run` count as none). Guard runs under `gap` between two flange runs along the
+    outline are label noise and go to the flange side (_fill_gaps).
     With flange_signs=False the flange chains come without signs and leans (the extra heights only
     need to know where they are).
     """
     if len(seg) == 0:
-        return [], [], [], [], [], np.zeros(0, bool)
+        return [], [], [], [], [], [], np.zeros(0, bool)
     mids = seg.mean(axis=1)
     outer = np.isin(labels, outside)
     mask = outer.copy() if side == "outside" else (labels >= 0) & ~outer
@@ -398,10 +454,19 @@ def _split_chains(seg, n2, nz, labels, outside: tuple, regions: shapely.STRtree,
         away = np.einsum("ij,ij->i", n2[other], mids[other] - ref) > 0
         mask[other] = away if side == "outside" else ~away
     tree = shapely.STRtree(shapely.points(mids))
+    mask = _fill_gaps(seg, mask, tree, gap, labels)
     f, g = _chains(seg[mask]), _chains(seg[~mask])
     fs = [_outward_sign(c, tree, n2, nz) for c in f] if flange_signs else []
     gs = [_outward_sign(c, tree, n2, nz)[0] for c in g]
-    return f, [s for s, _ in fs], [z for _, z in fs], g, gs, mask
+    rim = labels == RIM
+
+    def runs(c):            # None: no rim information (OTHER), so _end_cuts keeps the 1.0.1 line
+        q = np.asarray(c.coords)
+        if not rim.any() or other[tree.nearest(shapely.points((q[:-1] + q[1:]) / 2))].any():
+            return None, None
+        return _rim_runs(c, tree, rim, shortest_run)
+    gr = [runs(c) for c in g]
+    return f, [s for s, _ in fs], [z for _, z in fs], g, gs, gr, mask
 
 
 def _section(model: Model, cut: Cut) -> Section:
@@ -418,8 +483,10 @@ def _section(model: Model, cut: Cut) -> Section:
         raise CutError(f"{cut.label} does not go through the model. Drag it onto the model or delete it.")
     regions = shapely.STRtree([p.boundary for p in polys])
     refs = np.array([p.convex_hull.centroid.coords[0] for p in polys])
-    f_chains, f_signs, f_nz, g_chains, g_signs, mask = _split_chains(seg, n2, nz, labels, model.outside,
-                                                                     regions, refs, cut.side)
+    shortest = RIM_RUN * model.wall
+    f_chains, f_signs, f_nz, g_chains, g_signs, g_runs, mask = _split_chains(seg, n2, nz, labels, model.outside,
+                                                                             regions, refs, cut.side,
+                                                                             shortest_run=shortest, gap=model.wall)
     if not mask.any():
         raise CutError(f"{cut.label}: no wall faces the {cut.side} here. Choose the other flange side.")
     if not f_chains:
@@ -430,9 +497,10 @@ def _section(model: Model, cut: Cut) -> Section:
     levels = {}
     for z in (T / 2, T, -T / 2, -T):
         seg_z, n2_z, nz_z, labels_z = _segments(model, plane, dots, z)
-        f_z, _, _, g_z, gs_z, _ = _split_chains(seg_z, n2_z, nz_z, labels_z, model.outside, regions, refs,
-                                                cut.side, flange_signs=False)
-        levels[z] = (g_z, gs_z, _cs_to_shapely(mp.slice(z)), f_z)
+        f_z, _, _, g_z, gs_z, gr_z, _ = _split_chains(seg_z, n2_z, nz_z, labels_z, model.outside, regions, refs,
+                                                      cut.side, flange_signs=False, shortest_run=shortest,
+                                                      gap=model.wall)
+        levels[z] = (g_z, gs_z, _cs_to_shapely(mp.slice(z)), f_z, gr_z)
     shadow = None
     if H > 0:
         # The POC's tool cylinder runs from 0.01 mm above each flange face over the tool clearance H.
@@ -445,8 +513,8 @@ def _section(model: Model, cut: Cut) -> Section:
         shadow = _cs_to_shapely((mp ^ boxes).project())
     outline = np.vstack([np.asarray(r.coords) for p in polys for r in [p.exterior, *p.interiors]])
     lean = np.degrees(np.arcsin(np.clip(np.abs(nz[mask]), 0, 1)))
-    return Section(plane, area, refs, plane.world(outline), f_chains, f_signs, f_nz, g_chains, g_signs,
-                   levels, float(np.percentile(lean, 95)), shadow)
+    return Section(plane, area, refs, plane.world(outline), f_chains, f_signs, f_nz, g_chains, g_signs, g_runs,
+                   levels, float(np.percentile(lean, 95)), shadow, wall=model.wall)
 
 
 # ---------------------------------------------------------------- 2. layout
@@ -547,10 +615,11 @@ def _uncovered(ch: LineString, wall, W: float, step: float = 1.0) -> list:
     return out
 
 
-def _end_cuts(chains: list, level: tuple, W: float) -> list:
+def _end_cuts(chains: list, level: tuple, W: float, thickness: float = 0.0) -> list:
     """Per flange chain at the cut: what of its own bands lies past the mold's edge at one height.
 
-    `level` holds what that height sees: guard chains, their signs, the wall section, flange chains.
+    `level` holds what that height sees: guard chains, their signs, the wall section, flange chains,
+    and how far each guard chain runs along the rim from its ends.
     Along a stretch of the chain with no wall within the flange's reach at that height, the mold's
     edge is lower: its bands go there (_uncovered). Where a flange chain at that height ends against
     a guard chain (the rim; on a model that is not a thin shell, the face where the flange side flips),
@@ -558,35 +627,71 @@ def _end_cuts(chains: list, level: tuple, W: float) -> list:
     cut nearest to that end, so the flange ends square and flush with the edge (like 1.0.0's prolonged
     guard chains). 3 W + 2 far and wide: where the face meets the edge at a shallow angle, the band
     crosses the edge line far from the end.
+    The way on: where the guard chain starts with a full crossing of the rim (at least 3/4 of the wall
+    thickness and 1 mm, not folding back: a square or slanted rim, also cut at a slant), and on models
+    that are not thin shells, the line from 1 mm back along the guard chain, as in 1.0.1. Elsewhere on
+    a thin shell (a rounded or knife edge, a ridge where the edge's shape changes, a layer's height
+    clipping a rim's corner) the line is square across the wedge between the flange face and the
+    protected face after the rim (decision 55). A 1 mm line over a round, over the two faces of a
+    knife edge or onto the protected face turned up to 74 deg off the edge line and left flange
+    standing past it.
+    Where the labels flicker at the edge, crumbs under 1 mm (dropped by _chains) can lie between the
+    flange chain's end and the guard chain's: then the guard chain ending within 1.5 mm is carried on.
     Each of these cuts trims its own chain only, never the flange of another wall across a narrow
     opening (prolonged chains crossing there once erased a whole flange, decision 43).
     Returns per chain the region to remove, or None.
     """
-    g_chains, g_signs, wall, f_level = level
+    g_chains, g_signs, wall, f_level, g_runs = level
     out = [_uncovered(ch, wall, W) for ch in chains]
     if not chains:
         return []
     L = 3 * W + 2
     ends = {}                                   # end point -> guard chains that end there
-    for g, s in zip(g_chains, g_signs):
+    for g, s, (run0, run1) in zip(g_chains, g_signs, g_runs):
         if not g.is_closed:
             p = np.asarray(g.coords)
-            ends.setdefault(tuple(p[0]), []).append((g, s, True))
-            ends.setdefault(tuple(p[-1]), []).append((g, s, False))
+            ends.setdefault(tuple(p[0]), []).append((g, s, True, run0))
+            ends.setdefault(tuple(p[-1]), []).append((g, s, False, run1))
+    points = np.array(list(ends)) if ends else np.zeros((0, 2))
     for f in f_level:
         if f.is_closed:
             continue
         for P in (np.asarray(f.coords[0]), np.asarray(f.coords[-1])):
-            matches = ends.get(tuple(P), [])
-            if not matches:
-                continue
+            A = tuple(P)
+            if A not in ends:
+                # Crumbs under 1 mm (_chains drops them) can lie between the flange chain's end and the
+                # guard chain's, where the labels flicker at the edge: take the guard chain ending nearest
+                dist = np.linalg.norm(points - P, axis=1) if len(points) else np.zeros(0)
+                if not len(dist) or dist.min() > END_GAP:
+                    continue
+                A = tuple(points[int(np.argmin(dist))])
             i = int(np.argmin(shapely.distance(chains, Point(P))))
-            for g, s, at_start in matches:
+            Q = np.asarray(A)
+            kf = min(1.0, f.length / 2)
+            u_f = _unit(P - np.asarray(f.interpolate(kf if np.allclose(P, f.coords[0]) else f.length - kf).coords[0]))
+            for g, s, at_start, run in ends[A]:
+                along = lambda d: np.asarray(g.interpolate(d if at_start else g.length - d).coords[0])  # noqa: E731
                 k = min(1.0, g.length / 2)
-                q = np.asarray(g.interpolate(k if at_start else g.length - k).coords[0])
-                e = (P - q) / max(float(np.linalg.norm(P - q)), 1e-12)          # the guard chain's way on, past P
-                out[i].append(_swept_band(np.array([P + L * e, P]) if at_start else np.array([P, P + L * e]), s, L))
+                e = _unit(Q - along(k))                                           # the guard chain's way on, past Q
+                span = min(run or 0.0, 2.0)
+                straight = (run is not None and run >= max(1.0, FULL_RIM * thickness)
+                            and np.linalg.norm(along(span) - Q) >= 0.8 * span)
+                if run is not None and not straight and g.length > run + 0.05:
+                    # a thin shell whose rim here is not a full crossing (a rounded or knife edge, a ridge
+                    # where the edge's shape changes, a layer's height clipping a rim's corner): cut square
+                    # across the wedge between the flange face arriving at the end and the protected face
+                    # after the rim (the rim's own faces cover a fold unevenly: their mean normal tilted up
+                    # to 74 deg)
+                    u_g = _unit(along(min(run + 1.0, g.length)) - along(run))
+                    if u_f @ u_g < 0.99:
+                        axis = _unit(u_f - u_g)
+                        e = (s if at_start else -s) * np.array([-axis[1], axis[0]])   # band beyond the edge
+                out[i].append(_swept_band(np.array([Q + L * e, Q]) if at_start else np.array([Q, Q + L * e]), s, L))
     return [unary_union(c) if c else None for c in out]
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    return v / max(float(np.linalg.norm(v)), 1e-12)
 
 
 def _flange_outline(sec: Section, d: Derived, W: float) -> tuple:
@@ -607,7 +712,7 @@ def _flange_outline(sec: Section, d: Derived, W: float) -> tuple:
     Returns (cut-face outline, layers); layers are empty when one outline serves the whole slab.
     """
     T = d.thickness
-    levels = {0.0: (sec.g_chains, sec.g_signs, sec.area, sec.f_chains), **sec.levels}
+    levels = {0.0: (sec.g_chains, sec.g_signs, sec.area, sec.f_chains, sec.g_runs), **sec.levels}
 
     def bands(item):
         ch, s, nz = item
@@ -623,7 +728,7 @@ def _flange_outline(sec: Section, d: Derived, W: float) -> tuple:
     built = _parallel(lambda job: job(), jobs)
     guards = dict(zip(levels, built[:len(levels)]))
     chain_bands = built[len(levels):]
-    cuts = {z: _end_cuts(sec.f_chains, lv, W) for z, lv in levels.items()}
+    cuts = {z: _end_cuts(sec.f_chains, lv, W, sec.wall) for z, lv in levels.items()}
 
     def trim(g, zs, snap=True):
         for z in zs:
