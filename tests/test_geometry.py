@@ -1,6 +1,8 @@
-"""Geometry tests: the proof-of-concept checks, every option, several cuts, bad inputs, speed."""
+"""Geometry tests: the proof-of-concept checks, every option, several cuts, printed pins, bad inputs, speed."""
+import copy
 import json
 import math
+import re
 import time
 
 import numpy as np
@@ -13,7 +15,7 @@ from shapely.geometry import LineString, Point, Polygon
 from conftest import reload_stl
 from demo_mold import (MIXED_EDGE, cone_shell, demo_stl, mask_mold, mask_stl, mask_with_marks, mixed_edge_tube,
                        rounded_cup)
-from flangecutter.geometry import CutError, bolts, cutter, mesh_io
+from flangecutter.geometry import CutError, bolts, cutter, mesh_io, pins
 from flangecutter.geometry.mesh_io import RIM, stl_bytes
 
 ZC = 140.0
@@ -176,7 +178,7 @@ def hardware_overlap(res) -> float:
     per_cut = []
     for c, s, lay in zip(res.cuts, res.secs, res.lays):
         reach = c.d.thickness + c.d.protrusion
-        rod = Manifold.cylinder(2 * reach, c.d.bolt.washer / 2, -1, 24, True)
+        rod = Manifold.cylinder(2 * reach, c.d.footprint / 2, -1, 24, True)
         per_cut.append(Manifold.batch_boolean([rod.translate((x, y, 0.0)) for x, y in lay.pts], OpType.Add)
                        .transform(s.plane.to_world()))
     return sum((a ^ b).volume() for i, a in enumerate(per_cut) for b in per_cut[i + 1:])
@@ -337,18 +339,25 @@ def test_shell_surfaces_are_found(mask, model):
     assert set(np.unique(box.surfaces)) == {mesh_io.OTHER}             # not a shell: the POC's rule
 
 
+@pytest.mark.parametrize("bolt", ["M4", "pin"])
 @pytest.mark.parametrize("side", ["outside", "inside"])
-def test_face_mask_cut_through_the_nose(mask, side):
+def test_face_mask_cut_through_the_nose(mask, side, bolt):
     """Through the nose the profile is wavy: one flange along one face of the whole profile, square at
     the mold's edge, never on the other face (the POC's rule gave 6-7 pieces on both faces)."""
-    cs = cuts({"plane": {"origin": [0, 0, 0], "normal": [0, 1, 0], "x_axis": [1, 0, 0]}, "side": side, "count": 8})
+    cs = cuts({"plane": {"origin": [0, 0, 0], "normal": [0, 1, 0], "x_axis": [1, 0, 0]}, "side": side, "count": 8,
+               "bolt": bolt})
     assert len(cutter.section(mask, cs[0]).f_chains) == 1
     res = cutter.generate(mask, cs)
     for p in res.parts:
         tm = reload_stl(p.stl())
         assert tm.is_watertight and tm.nondegenerate_faces().all() and len(p.solid.decompose()) == 1
     (check,) = shell_checks(mask, res)
-    assert check["dirty"] < 0.005 and check["covered"] > 0.95 and check["past_rim"] < 0.01, check
+    # At T 6 (pins) the wall under part of the outer flange layer is square at the cut, so the wedge fill
+    # (decided at the cut) does not engage, but it curves away 30-40 deg within that layer, which then stands
+    # 0.75-1.75 mm off it (covered 0.894; M6 bolts at their automatic 6 mm give the same). A known limit of the
+    # flange, not of the pins.
+    covered = 0.87 if bolt == "pin" and side == "outside" else 0.95
+    assert check["dirty"] < 0.005 and check["covered"] > covered and check["past_rim"] < 0.01, check
     assert not {w["code"] for w in res.warnings} & {"unbolted_stretch", "offcut_dropped", "part_unbolted"}
 
 
@@ -726,6 +735,11 @@ def test_plane_misses_the_model(model):
 
 def test_too_many_bolts(model):
     assert "too many bolts" in cutter.preview(model, cuts(dict(TRANSVERSE, count=100)))["cuts"][0]["error"]
+    (c,) = cutter.preview(model, cuts(dict(PIN, count=100)))["cuts"]
+    assert "too many pins" in c["error"]               # and the error preview carries the cut's own values
+    assert (c["derived"]["kind"], c["derived"]["thickness"], c["derived"]["width"]) == ("pin", 6.0, 15.0)
+    (c,) = cutter.preview(model, cuts(dict(PIN, count=100, params={"pin_diameter": 12})))["cuts"]
+    assert c["derived"]["thickness"] == 8.0
 
 
 def test_non_watertight_mesh():
@@ -765,6 +779,12 @@ def test_bad_winding_and_inside_out_are_repaired():
     (dict(LENGTHWISE, params={"thickness": 50}), "between 2 and 20"),
     (dict(LENGTHWISE, count=0), "between 1 and 100"),
     (dict(LENGTHWISE, distribution={"mode": "spacing", "spacing": 1}), "spacing must be between"),
+    (dict(LENGTHWISE, bolt="Pin"), "unknown bolt size"),
+    (dict(LENGTHWISE, bolt="pin", params={"pin_diameter": 7}), "between 8 and 12"),
+    (dict(LENGTHWISE, bolt="pin", params={"pin_preload": 0.5}), "between 0 and 0.4"),
+    (dict(LENGTHWISE, bolt="pin", params={"pin_hole_clearance": -0.3}), "between -0.2 and 0.5"),
+    (dict(LENGTHWISE, bolt="pin", params={"wall_gap": 11}), "gap pin head to wall"),
+    (dict(LENGTHWISE, bolt="pin", count=0), "pin count must be between 1 and 100"),
 ])
 def test_bad_settings(raw, message):
     with pytest.raises(CutError, match=message):
@@ -806,3 +826,331 @@ def test_speed_on_100k_triangles(model_100k):
     print(f"\n100k triangles: preview {preview_s * 1000:.0f} ms, generate {generate_s:.2f} s")
     assert preview_s < 0.6 and generate_s < 6.0      # spec targets 0.3 s / 3 s; margin for slow CI runners
     assert all(reload_stl(p.stl()).is_watertight for p in res.parts)
+    spec = pins.PinSpec(8, 12.0, 0.1, 0.2)            # the largest pin file of a 100-pin cut
+    t = time.perf_counter()
+    assert pins.pin_ok(spec) and cutter._prints_ok(stl_bytes(pins.plate(spec, 102)))
+    assert time.perf_counter() - t < 1.5
+
+
+# ---------------------------------------------------------------- printed pins (1.1.0)
+PIN = dict(LENGTHWISE, bolt="pin")
+SLANT = {"plane": {"origin": [-30, 0, 0], "normal": [math.sqrt(0.5), math.sqrt(0.5), 0]}, "count": 8}
+TOP = {"plane": {"origin": [0, 0, 238.5], "normal": [0, 0, 1]}, "side": "outside", "count": 6}   # 1.5 mm under the top
+
+
+def pin_words(text: str):
+    """Bolt words in a pin text. "use bolts on this cut" is the one deliberate alternative (pin_no_room)."""
+    return re.search(r"\b(bolts?|washers?|nuts?)\b", text.replace("use bolts on this cut", ""), re.I)
+
+
+def pin_derive(fastening="through_nut", **params):
+    return bolts.derive("pin", fastening, bolts.check_params(params, "Cut 1", "pin"))
+
+
+def pin_in_plane(spec: pins.PinSpec, T: float, s: int, x=0.0, y=0.0, travel=0.0) -> Manifold:
+    """The pin in plane coordinates, head on side A (s = 1) or B (s = -1), its prongs moved in by `travel`.
+    Pin frame -> plane is a rotation for both signs, never a mirror."""
+    p = pins.pin_solid(spec)
+    if travel:
+        halves = [(p ^ Manifold.cube((40, 80, 80)).translate((0 if sg > 0 else -40, -40, -20))).translate((-sg * travel, 0, 0))
+                  for sg in (1, -1)]
+        p = Manifold.batch_boolean(halves, OpType.Add)
+    m = np.array([[1, 0, 0, x], [0, -s, 0, y], [0, 0, -s, s * T]], float)
+    return p.transform(m)
+
+
+def test_pin_derived_values():
+    d = pin_derive()
+    assert d.kind == "pin" and d.bolt is None and d.fastening is None and not d.warnings
+    assert (d.thickness, d.bolt_line(), d.flange_width(7.0), d.envelope_r, d.min_spacing) == (6.0, 7.0, 15.0, 6.5, 14.0)
+    assert d.hole_d == pytest.approx(8.1) and d.protrusion == pytest.approx(2.63, abs=0.01)
+    assert d.pin.insert_room == pytest.approx(25.03) and d.grip == 12.0 and d.bolt_length is None
+    for dia, want in ((10, (6.0, 8.5, 18.0, 10.1)), (12, (8.0, 10.0, 21.0, 12.1))):
+        x = pin_derive(pin_diameter=dia)
+        c = x.bolt_line()
+        assert (x.thickness, c, x.flange_width(c)) == want[:3] and x.hole_d == pytest.approx(want[3]) and not x.warnings
+    assert [bolts.pin_thickness(v) for v in (8, 10, 10.5, 11.7, 12)] == [6, 6, 7, 8, 8]
+    x = pin_derive(pin_hole_clearance=0.3, pin_preload=0.3)          # the fit values travel
+    assert (x.hole_d, x.pin.hole_clearance, x.pin.preload, x.pin.length) == pytest.approx((8.3, 0.3, 0.3, 16.93))
+    assert x.as_dict()["hole_diameter"] == pytest.approx(8.3)
+    x = pin_derive("nut_pocket", hole_diameter=5.0, hole_clearance=1.0, thickness=2.5)   # bolt values do not
+    assert x.hole_d == pytest.approx(8.1) and x.pocket_af is None
+    assert {w["code"] for w in x.warnings} == {"pin_flange_thin"}
+
+    def weak(**p):
+        return next(w["action"] for w in pin_derive(**p).warnings if w["code"] == "pin_weak")
+    assert "thicker" in weak(thickness=5)
+    assert "larger pin diameter" in weak(thickness=8) and "larger pin diameter" in weak(thickness=10)
+    assert "larger pin diameter" not in weak(thickness=20)           # a 12 mm pin holds only 31 N there
+    assert not pin_derive(thickness=6).warnings and not pin_derive(thickness=15, pin_diameter=12).warnings
+    with pytest.raises(TypeError):
+        pins.PinSpec(8, 12)                                          # no defaults: the fit values never get lost
+    with pytest.raises(CutError, match="gap pin head to wall must be between 0 and 10 mm"):
+        bolts.check_params({"wall_gap": 11}, "Cut 1", "pin")
+    with pytest.raises(CutError, match="gap washer to wall must be between 0 and 10 mm"):
+        bolts.check_params({"wall_gap": 11}, "Cut 1")
+
+
+@pytest.mark.parametrize("d, T, fit, preload", [
+    (8, 6, .1, .2), (8, 2, .1, .2), (8, 3.5, -.2, 0), (8, 20, .5, .4), (8.37, 4.55, .1, .2), (9.5, 6, 0, .1),
+    (10, 6, .1, .2), (10, 10, .3, .35), (11.2, 7, -.1, .2), (12, 8, .1, .2), (12, 2.5, .5, 0), (12, 20, .1, .4)])
+def test_pin_is_printable(d, T, fit, preload):
+    """Every pin the settings allow is one watertight body that lies on a flat side and needs no support."""
+    x = pin_derive(pin_diameter=d, thickness=T, pin_hole_clearance=fit, pin_preload=preload)
+    q = pins.q
+    spec = x.pin
+    assert spec == pins.PinSpec(q(d), q(2 * T), q(fit), q(preload)) and pins.pin_ok(spec)
+    tm = reload_stl(stl_bytes(pins.pin_solid(spec).transform(pins.print_pose(spec))))
+    assert tm.is_watertight and tm.is_winding_consistent and tm.nondegenerate_faces().all()
+    assert len(mesh_io.to_manifold(tm).decompose()) == 1 and abs(tm.bounds[0][2]) < 1e-6
+    assert tm.bounds[1] - tm.bounds[0] == pytest.approx([spec.length, spec.head_d, spec.w], abs=0.05)
+    nz, zmin = tm.face_normals[:, 2], tm.triangles[:, :, 2].min(axis=1)
+    assert tm.area_faces[(nz < -0.999) & (zmin < 1e-6)].sum() > 30                       # on its flat side
+    assert tm.area_faces[(nz < -math.cos(math.radians(45))) & (zmin > 0.1)].sum() < 0.01   # nothing to support
+
+
+def test_slot_rule_and_mechanics():
+    for d in (8, 10, 12):
+        spec = pins.PinSpec(d, 2 * bolts.pin_thickness(d), 0.1, 0.2)
+        m, (s0, s1) = pins.mechanics(spec), spec.slot
+        assert m["strain"] <= pins.DESIGN_STRAIN + 1e-4 and m["push_in"] <= pins.PUSH_MAX + 0.5
+        assert m["pull_out"] >= pins.PULL_MIN and pins.SLOT_MIN <= s0 and s1 <= spec.slot_max + 0.01
+    assert pins.mechanics(pins.PinSpec(8, 7.0, 0.1, 0.2))["strain"] > pins.STRAIN_LIMIT
+    hits = pins.mechanics.cache_info().hits
+    pins.mechanics(pins.PinSpec(8, 12.0, 0.1, 0.2))
+    assert pins.mechanics.cache_info().hits == hits + 1
+
+
+@pytest.mark.parametrize("d, T", [(8, 6.0), (10, 6.0), (12, 8.0)])
+@pytest.mark.parametrize("s", [1, -1])
+def test_pin_sits_in_its_hole(d, T, s):
+    """The pin overlaps its drilled stack only in the preload zone (the catch pulls the halves together);
+    with the prongs pushed in by the barb's travel, or by the preload, it does not overlap at all."""
+    spec = pins.PinSpec(d, 2 * T, 0.1, 0.2)
+    stack = Manifold.cube((30, 30, 2 * T)).translate((-15, -15, -T)) - pins.hole_cutter(spec, T, s)
+    over = (pin_in_plane(spec, T, s) ^ stack).volume()
+    band = pins.pin_solid(spec) ^ Manifold.cube((40, 40, spec.grip + 0.01 - spec.z_catch + 0.01)).translate(
+        (-20, -20, spec.z_catch - 0.01))
+    m = np.array([[1, 0, 0, 0], [0, -s, 0, 0], [0, 0, -s, s * T]], float)
+    assert 0 < over < 0.25 and (band.transform(m) ^ stack).volume() == pytest.approx(over, abs=1e-3)
+    for travel in (spec.barb - (spec.hole_d - spec.d) / 2, spec.preload):
+        assert (pin_in_plane(spec, T, s, travel=travel) ^ stack).volume() < 1e-3
+
+
+def test_pin_plate_and_fit_test():
+    spec = pins.PinSpec(8, 12.0, 0.1, 0.2)
+    plate = pins.plate(spec, 14)
+    data = stl_bytes(plate)
+    assert cutter._prints_ok(data)
+    bodies = mesh_io.to_manifold(reload_stl(data)).decompose()
+    assert len(bodies) == 14 and all(abs(b.bounding_box()[2]) < 1e-6 for b in bodies)
+    x0, y0, _, x1, y1, _ = plate.bounding_box()
+    assert max(x1 - x0, y1 - y0) <= pins.PLATE_MAX
+    x0, y0, _, x1, y1, _ = pins.plate(pins.PinSpec(12, 16.0, 0.1, 0.2), 102).bounding_box()
+    assert x1 - x0 <= pins.PLATE_MAX < y1 - y0          # rows stay within the sheet; deeper plates warn
+    ft = pins.fit_test(spec, 6.0)
+    assert reload_stl(stl_bytes(ft)).is_watertight
+    parts = sorted(ft.decompose(), key=lambda b: -b.volume())
+    assert len(parts) == 3 and all(abs(b.bounding_box()[2]) < 1e-6 for b in parts)
+    hole = math.pi * (spec.hole_d / 2) ** 2 * 6.0
+    assert all(sq.volume() == pytest.approx(24 * 24 * 6 - hole, rel=0.02) for sq in parts[:2])
+    assert parts[2].volume() == pytest.approx(pins.pin_solid(spec).volume(), rel=1e-3)
+
+    def hole_at_top(square):
+        g = cutter._cs_to_shapely(square.slice(5.9))
+        return sum(Polygon(r).area for poly in getattr(g, "geoms", [g]) for r in poly.interiors)
+    bevelled, sharp = sorted(parts[:2], key=lambda b: b.bounding_box()[0])     # the head-side square lies left
+    assert hole_at_top(bevelled) > 1.1 * hole_at_top(sharp)
+
+
+def hole_area(part, plane, x, y, z) -> float:
+    g = cutter._cs_to_shapely(part.solid.transform(plane.to_plane()).slice(z))
+    rings = [Polygon(r) for poly in getattr(g, "geoms", [g]) for r in poly.interiors]
+    return next(r for r in rings if r.contains(Point(x, y))).area
+
+
+@pytest.mark.parametrize("half, fastening", [("A", "through_nut"), ("B", "nut_pocket")])
+def test_pin_cut(model, cavity, half, fastening):
+    """Outside (check_parts counts an Inside flange as material in the cavity): watertight parts with pin
+    holes, bevelled on the head side only, the pin file and the fit test; every pin fits its hole."""
+    cs = cuts(dict(PIN, nut_pocket_half=half, fastening=fastening))
+    res = cutter.generate(model, cs)
+    lay, d, plane = res.lays[0], cs[0].d, res.secs[0].plane
+    assert [p.name for p in res.parts] == ["A", "B"]
+    check_parts(res, model, cavity, cs)
+    assert (lay.c, lay.W, d.thickness) == (7.0, 15.0, 6.0) and len(lay.pts) == 8
+    assert not {w["code"] for w in res.warnings} & {"pin_no_room", "bolts_blocked", "pin_fit"}
+    (plate,) = res.pins
+    assert (plate.cut, plate.needed, plate.spares, plate.count, plate.head_side) == (0, 8, 2, 10, half)
+    assert len(mesh_io.to_manifold(reload_stl(plate.stl())).decompose()) == 10
+    assert [f.cuts for f in res.fit_tests] == [[0]]
+    s, T, (x, y) = (1 if half == "A" else -1), d.thickness, lay.pts[3]
+    head = next(p for p in res.parts if p.signature == half)
+    barb = next(p for p in res.parts if p.signature != half)
+    a = d.hole_d / 2
+    plain = 48 * a * a * math.tan(math.pi / 48)          # the circumscribed 48-gon
+    assert hole_area(head, plane, x, y, s * (T - 0.3)) > 1.1 * plain                       # the bevel
+    assert hole_area(barb, plane, x, y, -s * (T - 0.3)) == pytest.approx(plain, rel=0.01)   # sharp: the catch
+    for part, z in ((head, s * T / 2), (barb, -s * T / 2)):
+        assert hole_area(part, plane, x, y, z) == pytest.approx(plain, rel=0.01)             # no nut pocket
+    for part, z in ((head, s * 0.2), (barb, -s * 0.2)):
+        assert hole_area(part, plane, x, y, z) > 1.02 * plain                              # the joint bevel
+    union = Manifold.batch_boolean([p.solid for p in res.parts], OpType.Add)
+    for px, py in lay.pts:                       # only the preload zone overlaps, as in the bare stack
+        pin = pin_in_plane(d.pin, T, s, px, py).transform(plane.to_world())
+        assert (pin ^ union).volume() == pytest.approx(0.108, abs=0.01)
+
+
+def test_pins_need_the_full_flange(model):
+    res = cutter.generate(model, cuts(dict(TOP, bolt="pin")))
+    assert "pin_fit" in {w["code"] for w in res.warnings}
+
+
+def test_pin_and_bolt_cuts_cross(model, cavity):
+    cs = cuts(PIN, ACROSS_Z)
+    res = cutter.generate(model, cs)
+    assert [p.name for p in res.parts] == ["A", "B", "C", "D"]
+    check_parts(res, model, cavity, cs)
+    assert hardware_overlap(res) < 0.01
+    codes = {w["code"] for w in res.warnings}
+    assert not codes & {"joint_unbolted", "part_unbolted"}
+    side = next(w for w in res.warnings if w["code"] == "pin_holes_sideways")
+    assert "parts A, B, C and D" in side["message"]
+    assert {h["spec"].split()[0] for h in cutter.hardware(res.cuts, res.lays)} == {"M4"}
+    assert all(p.pins > 0 and p.bolts > 0 for p in res.parts)
+    report = cutter.report_text(res, "demo_mold.stl", "x", "1.1.0", {p.name: f"{p.name}.stl" for p in res.parts})
+    assert all(re.search(r"\d+ bolts, \d+ pins$", line) for line in report.splitlines() if line.startswith("  Part "))
+
+
+def test_pin_report_and_hardware(model):
+    res = cutter.generate(model, cuts(PIN))
+    assert cutter.hardware(res.cuts, res.lays) == []
+    report = cutter.report_text(res, "demo_mold.stl", "x", "1.1.0", {"A": "a.stl", "B": "b.stl"}, {1: "p.stl"},
+                                {1: "f.stl"})
+    for text in ("Pins:", "p.stl", "f.stl", "10 pins (8 + 2 spares)", "nothing to buy", "joins: A-B (8 pins)",
+                 "pushed in from part B", "The fit test", "Extra pin hole size 0.2, then 0.3",
+                 "Pin preload 0.1, then 0", "To take a pin out"):
+        assert text in report, text
+    assert "Keep each cut's pins apart" not in report and not pin_words(report)
+    assert cutter.report_text(res, "demo_mold.stl", "x", "1.1.0", {})          # five arguments still work
+    shell, mid = cone_shell(lean=30)
+    cone = mesh_io.load_stl(plain_stl(shell), "cone.stl")
+    level = {"plane": {"origin": [0, 0, mid], "normal": [0, 0, 1]}, "side": "inside", "count": 8, "bolt": "pin"}
+    jobs = [(model, PIN, set()), (model, dict(TRANSVERSE, bolt="pin"), {"bolt_line_moved"}),
+            (cone, dict(level, nut_pocket_half="A"), {"pin_no_room"}),
+            (cone, dict(level, nut_pocket_half="B"), {"bolts_blocked", "wall_angle"}),
+            (model, dict(TOP, bolt="pin"), {"pin_fit", "joint_unbolted", "part_unbolted"})]
+    for m, raw, want in jobs:
+        res = cutter.generate(m, cuts(raw))
+        assert want <= {w["code"] for w in res.warnings}, raw
+        for w in res.warnings:
+            assert not pin_words(f"{w['message']} {w['action']}"), w
+    close = dict(ACROSS_Z, plane={"origin": [0, 0, 135], "normal": [0, 0, 1]})     # bolts, but none fit
+    res = cutter.generate(model, cuts(ACROSS_Z, close))
+    report = cutter.report_text(res, "demo_mold.stl", "x", "1.1.0", {p.name: "" for p in res.parts})
+    assert "Hardware (all cuts):\n\nWarnings:" in report and "nothing to buy" not in report     # as in 1.0.x
+
+
+def test_pin_plate_warning(model, monkeypatch):
+    monkeypatch.setattr(pins, "PLATE_MAX", 40.0)
+    res = cutter.generate(model, cuts(PIN))
+    assert "pin_plate_large" in {w["code"] for w in res.warnings}
+    assert len(mesh_io.to_manifold(reload_stl(res.pins[0].stl())).decompose()) == 10
+    monkeypatch.setattr(cutter, "_prints_ok", lambda data: False)
+    res = cutter.generate(model, cuts(PIN))
+    texts = [w["message"] for w in res.warnings if w["code"] == "pins_not_watertight"]
+    assert any("pin file" in t for t in texts) and any("fit test" in t for t in texts)
+
+
+def test_two_pin_cuts(model):
+    across = dict(ACROSS_Z, bolt="pin")
+    res = cutter.generate(model, cuts(PIN, across))                 # (a) the same pins
+    assert [p.cut for p in res.pins] == [0, 1] and res.pins[0].spec == res.pins[1].spec
+    assert cutter.summary(res)["pins"][1]["same_as"] == 1
+    assert [f.cuts for f in res.fit_tests] == [[0, 1]]
+    report = cutter.report_text(res, "m.stl", "x", "1.1.0", {}, {1: "p1.stl", 2: "p2.stl"}, {1: "f.stl"})
+    assert "Fit test for cuts 1 and 2" in report and "the same pins as cut 1" in report
+    assert "Keep each cut's pins apart" not in report
+    res = cutter.generate(model, cuts(PIN, dict(across, params={"thickness": 8})))     # (b) longer pins
+    assert [round(p.spec.length, 2) for p in res.pins] == [17.03, 21.03]
+    assert cutter.summary(res)["pins"][1]["same_as"] is None
+    assert [(f.cuts, f.thickness) for f in res.fit_tests] == [([0], 6.0), ([1], 8.0)]
+    report = cutter.report_text(res, "m.stl", "x", "1.1.0", {}, {1: "p1.stl", 2: "p2.stl"}, {1: "f1.stl", 2: "f2.stl"})
+    assert "Keep each cut's pins apart" in report
+    assert any(w["code"] == "pin_weak" and w["message"].startswith("Cut 2") for w in res.warnings)
+
+
+def test_pins_need_room_to_go_in(mask, mixed, model):
+    """A pin goes in only along its axis, from the head side: about 25 mm free there (decision 69). Only a
+    warning, and the blocked pins are marked in the 2D view: the user decides."""
+    for half, want in (("B", True), ("A", False)):
+        (c,) = cutter.preview(mask, cuts(dict(SLANT, side="inside", bolt="pin", nut_pocket_half=half)))["cuts"]
+        room = [w for w in c["warnings"] if w["code"] == "pin_no_room"]
+        assert bool(room) == want, (half, c["warnings"])
+        if want:
+            assert "pin 1, 2, 3, 4, 5, 6, 7, 8 " in room[0]["message"]
+            assert room[0]["action"] == "Move or rotate the cut, or use bolts on this cut."
+            assert all(b["blocked"] for b in c["bolts"])               # marked in the 2D view
+    a = math.radians(175)
+    for half in ("A", "B"):
+        (c,) = cutter.preview(mixed, cuts({"plane": {"origin": [0, 0, 25], "normal": [-math.sin(a), math.cos(a), 0]},
+                                           "side": "inside", "count": 4, "bolt": "pin", "nut_pocket_half": half}))["cuts"]
+        room = [w for w in c["warnings"] if w["code"] == "pin_no_room"]
+        assert room and f"pin {', '.join(str(i + 1) for i in range(c['count']))} " in room[0]["message"], half
+    # the advice: the other head side is named only when it would work for all of those pins
+    cs = cuts(PIN)
+    pl = cutter.plan(model, cs)
+    sec, lay = copy.copy(pl.secs[0]), pl.lays[0]
+    h, room = cs[0].d.tool_clearance, max(cutter._tool_heights(cs[0]))
+    disc = Point(*lay.pts[0]).buffer(2).union(Point(*lay.pts[1]).buffer(2))
+    sec.shadows = {(1, h): None, (-1, h): None, (1, room): None, (-1, room): disc}
+    lay.blocked, lay.warnings = [0, 1], []
+    cutter._pin_room(cs[0], sec, lay)
+    (w,) = lay.warnings
+    assert "pin 1, 2 in from the other side" in w["message"] and "25 mm" in w["message"]
+    assert w["action"] == "Choose Pin heads on: Arrow side, or move the cut."
+    sec.shadows[(1, room)] = disc
+    lay.warnings = []
+    cutter._pin_room(cs[0], sec, lay)
+    assert lay.warnings[0]["action"] == "Move or rotate the cut, or use bolts on this cut."
+    # review: a switch that would only block the other pins is not advised
+    (c,) = cutter.preview(model, cuts({"plane": {"origin": [6.6, 0, 120], "normal": [1, 0, 0]}, "side": "inside",
+                                       "count": 8, "bolt": "pin", "nut_pocket_half": "A"}))["cuts"]
+    (w,) = [w for w in c["warnings"] if w["code"] == "pin_no_room"]
+    assert w["action"] == "Move or rotate the cut, or use bolts on this cut."
+    # review: two pin cuts whose heads face each other leave no room; the action offers the other side
+    level = {"normal": [0, 0, 1], "x_axis": [1, 0, 0]}
+    pv = cutter.preview(model, cuts(
+        {"plane": dict(level, origin=[0, 0, 120]), "count": 6, "bolt": "pin", "nut_pocket_half": "A"},
+        {"plane": dict(level, origin=[0, 0, 142]), "count": 6, "bolt": "pin", "nut_pocket_half": "B"}))
+    for c in pv["cuts"]:
+        w = next(w for w in c["warnings"] if w["code"] == "no_bolts")
+        assert "Pin heads on" in w["action"] and not pin_words(w["message"] + " " + w["action"])
+
+
+def test_a_narrowing_wall_blocks_the_tools():
+    """1.0.2 lost the far band of a narrowing wall's shadow inside the near band's hole (decision 70)."""
+    shell, mid = cone_shell(lean=30)
+    cone = mesh_io.load_stl(plain_stl(shell), "cone.stl")
+    level = {"plane": {"origin": [0, 0, mid], "normal": [0, 0, 1]}, "side": "inside", "count": 8}
+    (c,) = cutter.preview(cone, cuts(dict(level, bolt="M4")))["cuts"]
+    blocked = next(w for w in c["warnings"] if w["code"] == "bolts_blocked")
+    assert "bolt 1, 2, 3, 4, 5, 6, 7, 8." in blocked["message"]
+    (c,) = cutter.preview(cone, cuts(dict(level, bolt="pin", nut_pocket_half="A")))["cuts"]
+    assert "pin_no_room" in {w["code"] for w in c["warnings"]}
+    (c,) = cutter.preview(cone, cuts(dict(level, bolt="pin", nut_pocket_half="B")))["cuts"]
+    assert "take it out" in next(w for w in c["warnings"] if w["code"] == "bolts_blocked")["message"]
+    sq = lambda a, b, cw=False: np.array([(a, a), (b, a), (b, b), (a, b)][::-1 if cw else 1], float)   # noqa: E731
+    g = cutter._cs_to_shapely(CrossSection([sq(0, 40), sq(10, 30, cw=True), sq(15, 25)]))
+    assert g.area == pytest.approx(40 ** 2 - 20 ** 2 + 10 ** 2)
+
+
+def test_pins_keep_the_least_blocked_step():
+    """When every step is blocked, a pin cut keeps the step with the least mold in its tool discs; bolts
+    keep the first step, as in 1.0.x (decisions 16 and 71)."""
+    for lean, bolt, moved in ((20, "pin", 6), (30, "M4", 0)):
+        shell, mid = cone_shell(lean=lean)
+        cone = mesh_io.load_stl(plain_stl(shell), "cone.stl")
+        cs = cuts({"plane": {"origin": [0, 0, mid], "normal": [0, 0, 1]}, "side": "outside", "count": 8, "bolt": bolt})
+        lay = cutter.plan(cone, cs).lays[0]
+        assert lay.blocked and lay.moved == moved, (bolt, lay.moved, lay.blocked)

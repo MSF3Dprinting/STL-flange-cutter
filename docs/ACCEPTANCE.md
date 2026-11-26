@@ -9,7 +9,9 @@ standard user account **without admin rights**, Python 3.12.10. Version 1.0.0 wa
 portable ZIP, the only package since 1.0.1 (decision 46), built with `build\build_windows.ps1`
 (unsigned). Version 1.0.2 was checked on 2026-11-19 by the automatic tests and the real-mold run of
 A10, and with its portable ZIP (unsigned, smoke-tested by the build script): the unzipped app
-opened both field molds of A10 without warnings and cut them on both flange sides. Most checks were run by script; the evidence is in the commit
+opened both field molds of A10 without warnings and cut them on both flange sides. Version 1.1.0
+(printed pins) was checked on 2026-11-26 by the automatic tests (A11); **it goes to the field only
+after the field test of A11** (owner). Most checks were run by script; the evidence is in the commit
 messages and `docs/DECISIONS.md`. Everything not ticked is still **open**.
 
 ## A. Spec checklist (section 8)
@@ -66,6 +68,7 @@ messages and `docs/DECISIONS.md`. Everything not ticked is still **open**.
 
 - [x] Automated (`tests/test_geometry.py`, `tests/test_ui.py`): `samples\demo_mold.stl`, lengthwise
   cut, 8 × M4: two parts, watertight after STL export and reload, no overlap, no flange in the cavity.
+  The same cut with pins (automated): two parts, the pin file and the fit test.
 - [ ] **By hand:** in the app, open the sample, **Across Y**, Generate, download both parts.
 
 ### A7. PrusaSlicer opens the parts without repair warnings
@@ -149,6 +152,28 @@ messages and `docs/DECISIONS.md`. Everything not ticked is still **open**.
 - [ ] **Open:** the flange material on the protected face on two cuts of the 199,000-triangle mold
   (a spot on an Inside cut, a small patch beside the edge on an Outside cut; also with 1.0.1's
   cutter): check them in the slicer, and look at them in the code if they show.
+
+### A11. Printed pins (1.1.0)
+
+- [x] Automated (2026-11-26, `tests/`): every pin the settings allow is one watertight body that
+  prints lying on a flat side; the pin in its hole overlaps only in the preload zone; pin files and
+  fit tests are watertight; pin cuts on the demo mold (both head sides) and the test mask; two pin
+  cuts; pin and bolt cuts crossing (sideways holes); the room to push pins in; the API and the page
+  (Pin button, hidden fields, downloads, ZIP, saved settings, Reset). The forces are a beam model
+  (±30 %): nothing was printed yet.
+- [ ] **Field test (release gate):** on the field printer(s), the fit test with the default values:
+  the pin goes in with a thumb, clicks, and holds the squares together. Try Extra pin hole size 0.0
+  and 0.2 too, and note the best values per printer.
+- [ ] A pin comes out with pliers and goes back once; a cut pin comes out.
+- [ ] The sample (or a smaller mold) with pins: assembled, it holds by itself and opens again.
+- [ ] A cross cut with pins and bolts: the sideways warning shows, and the sideways holes take a pin
+  (or need opening a little).
+- [ ] A real face-mask mold cut through the nose with pins, Outside and Inside: the pins flagged "no
+  room to push" really cannot go in, and the others go in with a thumb (checks the 8 mm push room).
+- [ ] PrusaSlicer opens a pin file and a fit test without repair warnings.
+- [ ] 1366 × 768: Pin on the same line as M3-M6.
+- [ ] A 1.1.0 settings file with pins opened in 1.0.2: the notice "cut 1 bolt size".
+- [ ] A field user follows the fit-test steps in `report.txt` without the manual.
 
 ## B. Other checks that could not be done on the development laptop
 

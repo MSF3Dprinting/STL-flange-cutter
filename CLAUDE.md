@@ -1,7 +1,7 @@
 # Flange Cutter: guide for Claude Code sessions
 
 Local app (Flask + one three.js page) that cuts thin-walled mold STLs with one or more planes and
-adds a bolted flange on one face of the wall. Users: MSF field staff on Windows laptops without
+adds a flange on one face of the wall, held by bolts or printed snap pins. Users: MSF field staff on Windows laptops without
 admin rights, often offline. Original spec: `flange_cutter_prompt.md`; owner decisions that change
 it: `docs/DECISIONS.md` (several crossing cuts per session, every cut fully configurable).
 
@@ -25,7 +25,8 @@ them to a temporary folder).
 
 - `flangecutter/geometry/`: `bolts.py` (all ISO data, fastening registry, parameter metadata,
   bolt length rule), `mesh_io.py` (load, repair, surface labels, STL clean-up, ZIP), `cutter.py`
-  (everything else geometric).
+  (everything else geometric), `pins.py` (printed snap pin: sizes, slot rule, solid, pin file,
+  hole cutter, fit test).
 - `flangecutter/server.py` (thin Flask routes), `session.py` (memory + app folder),
   `__main__.py` (launcher, single instance, logging).
 - `flangecutter/static/`: `index.html`, `app.css`, `js/{main,viewer,panel,cutview,api}.js`,
@@ -87,3 +88,13 @@ them to a temporary folder).
   `model.bounds`, not the trimesh cached properties (slow re-hashing).
 - Manifold evaluates lazily; `to_mesh()` returns float32; heights come from `bounding_box()`.
 - three.js r187 `TransformControls` is added to the scene through `getHelper()`.
+- Pins are never Parts: own lists (`Result.pins`, `fit_tests`), routes, ZIP entries; a pin file is
+  the one multi-body STL, every body on z = 0. A pin is made for 2T: keep `pin_fit` on the full
+  four-layer stack (`Layout.stack`).
+- Pin solids: half-step ring phase, consecutive hulls share rings exactly, the barb clip lies inside
+  the slot, the slot is turned by a rotation (never a mirror); the hole's joint bevel keeps a 0.1 mm
+  band across the plane. The slot rule costs about 0.1 s per new (d, grip, preload): keep its cache.
+- A pin goes in only along its axis from the head side: test the two flange faces on their own
+  (`_tool_heights`, `Section.shadows`), never one shadow for both. `_cs_to_shapely` is even-odd: a
+  region can lie in another's hole.
+- A hidden page field is force-cleared (`setField(…, true)`), or a red value blocks Generate.

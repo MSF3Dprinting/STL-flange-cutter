@@ -16,8 +16,9 @@ flowchart LR
     A -- "JSON over HTTP, 127.0.0.1 only" --> S[server.py<br/>Flask routes]
     S --> SE[session.py<br/>model, results, prefs]
     S --> IO[geometry/mesh_io.py<br/>load, repair, surface labels,<br/>STL clean-up, ZIP]
-    S --> CU[geometry/cutter.py<br/>sections, flanges, bolts, 3D build]
+    S --> CU[geometry/cutter.py<br/>sections, flanges, bolts, pins, 3D build]
     CU --> B[geometry/bolts.py<br/>ISO data, parameters, rules]
+    CU --> PI[geometry/pins.py<br/>snap pin, pin file, fit test]
     SE -. "settings.json, logs, lock file" .-> D[("%LOCALAPPDATA%\FlangeCutter")]
 ```
 
@@ -29,8 +30,9 @@ flowchart LR
    the page draws it on the planes and in the 2D cut view.
 3. **Generate**: `POST /api/generate` builds the solid once, splits it into parts, checks them,
    and returns the parts list. The page loads each part's STL and places it with its matrix.
-4. **Export**: the part STLs (cleaned of sliver triangles, step 13 below) and a ZIP (all parts +
-   `report.txt` + `settings.json`) are plain downloads.
+4. **Export**: the part STLs (cleaned of sliver triangles, step 13 below), with pins also each pin
+   cut's pin file and the fit tests (step 14), and a ZIP (all of them + `report.txt` +
+   `settings.json`) are plain downloads.
 
 State lives in memory (`session.py`): one open model and the last three results. On disk the
 app writes only to its folder in the user profile: `settings.json` (last-used values),
@@ -47,7 +49,8 @@ app). `FLANGECUTTER_HOME` overrides the folder (tests use it).
 | `flangecutter/session.py` | In-memory model and results; app folder; preferences. |
 | `flangecutter/geometry/bolts.py` | All ISO data, the fastening registry, parameter metadata (labels, units, ranges, help), derived defaults, the bolt length rule. |
 | `flangecutter/geometry/mesh_io.py` | Load, repair, check; label every face at load (outer side, inner side, rim or OTHER: `shell_surfaces`); STL output with sliver clean-up (`stl_bytes`); ZIP output. |
-| `flangecutter/geometry/cutter.py` | Plane frames, sections, flange outlines, bolt placement, all checks, 3D build, parts, reports. |
+| `flangecutter/geometry/cutter.py` | Plane frames, sections, flange outlines, bolt and pin placement, all checks, 3D build, parts, pin files, reports. |
+| `flangecutter/geometry/pins.py` | The printed snap pin (decisions 57-62): sizes from the diameter and the grip (`PinSpec`), the slot rule and the beam mechanics (cached), the pin solid, the pin file (pins lying flat), the hole cutter with its bevels, the fit test. |
 | `flangecutter/static/` | The page: `index.html`, `app.css`, `js/main.js` (wiring and state), `js/viewer.js` (3D), `js/panel.js` (steps and fields), `js/cutview.js` (2D SVG), `js/api.js` (fetch helpers), `vendor/three/` (three.js r187, unmodified). |
 
 ## Coordinate conventions
@@ -81,14 +84,16 @@ details in the log).
 |---|---|
 | `GET /` | The page. |
 | `GET /api/ping` | `{"app": "flangecutter", "version"}`: the single-instance check. |
-| `GET /api/bolts` | Bolt sizes with ISO data and automatic values, fastening types, parameter metadata, count and spacing ranges, defaults, version. |
+| `GET /api/bolts` | Bolt sizes with ISO data and automatic values, the pin (`pin`: key, label, help, spares, suggest_pitch, automatic values), fastening types, parameter metadata (with `kinds`: the fasteners that use it, and the pin wording `pin_label`, `pin_help`), count and spacing ranges, defaults, version. |
 | `POST /api/model` | Multipart `file`. Returns `model_id`, `name`, `sha256`, `triangles`, `bbox` (`min`, `max`, `size`, `center`), `watertight`, `repaired`, `warnings`. |
 | `GET /api/model/<id>/mesh.stl` | The checked mesh, for display. |
 | `POST /api/preview` | 2D layout of every cut (below). HTTP 200 also when a cut has a problem: that cut carries `error`. An invalid request (a model that is no longer open, no cuts, unknown or out-of-range settings) gets HTTP 400. |
-| `POST /api/generate` | 3D build. Returns `result_id`, `parts`, `cuts`, `hardware`, `warnings`, `preview`, `zip`, `seconds`. HTTP 400 if any cut has an error. |
+| `POST /api/generate` | 3D build. Returns `result_id`, `parts`, `cuts`, `hardware`, `pins`, `fit_tests`, `warnings`, `preview`, `zip`, `seconds`. HTTP 400 if any cut has an error. |
 | `GET /api/progress` | `{"busy", "stage", "fraction"}` while a job runs. |
 | `GET /api/result/<id>/<part>.stl` | One part in print position, e.g. `A.stl`. |
-| `GET /api/result/<id>/bundle.zip` | All parts + `report.txt` + `settings.json`. |
+| `GET /api/result/<id>/pins/<n>.stl` | The pin file of cut n (1-based). Its own path segment: a flat `pins_1.stl` would fall into the part route. |
+| `GET /api/result/<id>/fit/<n>.stl` | The fit test whose first cut is n. |
+| `GET /api/result/<id>/bundle.zip` | All parts, pin files and fit tests + `report.txt` + `settings.json`. |
 | `GET` / `POST /api/prefs` | Last-used settings (kept across upgrades). |
 | `POST /api/shutdown` | Stop the server (the Quit button). |
 
@@ -104,6 +109,10 @@ details in the log).
                       "tool_clearance": 12, "end_margin": 3}}]}
 ```
 
+A cut with pins has `"bolt": "pin"` and the pin numbers among its params (`pin_diameter`,
+`pin_hole_clearance`, `pin_preload`); its `nut_pocket_half` is the side the pins go in from, its
+`fastening` is kept but ignored. Every cut carries every parameter (decision 59).
+
 `null` means automatic. The spec's single-cut form (the cut's fields at the top level, with
 `count`) is still accepted; unknown parameters such as the spec's `overlap` are ignored. The **settings file** (Save settings, and `settings.json` in the ZIP)
 is `{"format": 1, "app", "version", "model": {"name", "sha256"}, "cuts": [...]}` with the same
@@ -114,14 +123,21 @@ cut objects, so loading it is just sending its cuts.
 `bolts` (`xy`, `xyz`, `blocked`), `bolt_line` and `free` (polylines: the whole bolt line and the
 stretches where bolts may go), `crossings` (lines where other cuts cross this plane), `cavities`
 (label points), `derived` (thickness, width, bolt_line, hole_diameter, washer, bolt_length, grip,
-pocket size, how far the bolt line moved), `count`, `suggested_count`, `warnings`. Top level:
+pocket size, how far the bolt line moved; `kind` "bolt" or "pin", and `pin`: diameter, head,
+head_height, barb, length; `washer` is the pin head for pins), `count`, `suggested_count`, `warnings`.
+A cut with an error has only `frame`, `error` and its own `derived` (decision 72). Top level:
 `warnings` that involve two cuts, `ms`.
 
 **Generate response**: `parts[]` (`name`, `file`, `url`, `signature`, `volume_cm3`, `size`,
-`triangles`, `face_down`, `cuts`, `bolts`, `overhang_cm2`, `to_world`, `explode`), `cuts[]` (bolt
-spec, nuts, washers, flange values and `joins`: which parts the cut bolts together, with how many
-bolts), `hardware` (shopping list for all cuts), `warnings` (each `{code, message, action}`), and
-`preview` (the final 2D layout).
+`triangles`, `face_down`, `cuts`, `bolts`, `pins`, `overhang_cm2`, `to_world`, `explode`), `cuts[]`
+(bolt spec, nuts, washers, flange values, `joins`: which parts the cut bolts together, with how many
+bolts, `kind`, and for pin cuts `pin`: diameter, length, grip, head_side, push_from, needed, spares,
+count; the keys named `bolts` count the pins of a pin cut), `hardware` (shopping list for all cuts;
+pin cuts buy nothing), `pins[]` (per pin cut: `cut`, `count`, `needed`, `spares`, `diameter`,
+`length`, `flange_thickness`, `grip`, `hole_diameter`, `head_side`, `push_from`, `same_as`, `size`,
+`triangles`, `file`, `url`), `fit_tests[]` (`cuts`, `diameter`, `flange_thickness`, `hole_diameter`,
+`size`, `triangles`, `file`, `url`), `warnings` (each `{code, message, action}`), and `preview` (the
+final 2D layout).
 
 ## Geometry, step by step
 
@@ -248,24 +264,36 @@ Per cut, in that cut's plane coordinates (`cutter.section` and `cutter.layout`):
    (c + washer/2 + end distance) at real flange ends. Count mode shares the count by length
    (largest remainder, at least 2 per stretch where they fit); spacing mode aims for the given
    distance. Too many bolts for the room is an error that names the maximum.
-7. **Tool clearance**: the mold beyond both flange faces (up to the tool clearance) is projected
-   onto the plane once; a bolt is blocked if its tool disc (washer/2 + 0.5 mm) overlaps that
-   shadow. While any bolt is blocked the bolt line moves out 1 mm (up to 6 mm).
+7. **Tool clearance**: the mold beyond each flange face, over that face's tool height, is projected
+   onto the plane once per face and height and kept on the section (`Section.shadows`,
+   `_add_shadows`); a bolt is blocked if its tool disc (washer/2 + 0.5 mm) overlaps the union of the
+   two faces' shadows. Bolts: the tool clearance on both faces. Pins (`_tool_heights`, decision 69):
+   the head side over max(tool clearance, pin length + 8 mm), because a pin goes in only along its
+   axis from there; the barb side over the tool clearance (pliers). While any bolt or pin is blocked
+   the bolt line moves out 1 mm (up to 6 mm); of equal steps the first stays (decision 16); when
+   every step is blocked a pin cut keeps the least mold in its discs (decision 71). The shadows
+   are even-odd regions (`_cs_to_shapely`, decision 70).
 8. **Checks and warnings**: wall angle (95th percentile of the flange-side lean), bolt spacing,
-   washer fit (on both outer faces of the flange, z = ±T), blocked bolts, count raised, stretches
-   without room for a bolt.
+   washer fit (on both outer faces of the flange, z = ±T) or, for pins, `pin_fit` (the head disc
+   on the full four-layer stack, `Layout.stack`), blocked bolts or, for pins, `pin_no_room` (no
+   room on the head side) and `bolts_blocked` (no room for pliers), count raised, stretches
+   without room for a bolt. Pin cuts get pin words in every text; the derive step adds
+   `pin_flange_thin` and `pin_weak` (decision 60).
 
 **Crossing cuts.** A bolt position p of cut i is kept only if, for every other cut j,
 `max(0, |dist(p, plane j)| − (T_i + max(H_i, protrusion_i))·|cos θ|) − r_i·sin θ ≥ T_j + protrusion_j + 0.5 mm`,
-where θ is the angle between the planes, H the tool clearance, r = washer/2 + 0.5 mm and
-protrusion = how far bolt end, nut or head stick out of a flange face. So holes, washers, nuts and
+where θ is the angle between the planes, H the tool height of the side that faces plane j
+(`_tool_heights`), r = washer (pin head)/2 + 0.5 mm and protrusion = how far bolt end, nut, head, pin
+head or pin tip stick out of a flange face. So holes, washers, nuts and
 tools of one cut never meet the other cut's flange or hardware. Two cuts must cross inside the
 wall at 15° or more, or keep their flanges apart; this is judged from where each plane lies
 relative to the other cut's wall section.
 
 Then, once for all cuts (`cutter.generate`):
 
-9. **Solid**: mold ∪ every flange solid − every bolt hole and nut pocket. Only **then** split by
+9. **Solid**: mold ∪ every flange solid − every bolt hole and nut pocket, or pin hole
+   (`pins.hole_cutter`: d + clearance on the circumscribed 48-gon, a 0.6 mm bevel on the head-side
+   face, a 0.3 mm bevel at both cut faces with a 0.1 mm band across the plane). Only **then** split by
    every plane in turn. A flange solid (`cutter._flange_solid`) is one slab from −T to +T when one
    outline serves it. Otherwise it is a core over the cut-face outline from −T/2 to T/2, minus
    trimming prisms for the inner layers that start 0.02 mm off the plane, plus the outer layers
@@ -287,6 +315,17 @@ Then, once for all cuts (`cutter.generate`):
     skipped (the unsimplified solid is used, or the needle stays). So a part's STL file has
     slightly fewer triangles than its solid (`triangles` in the generate response counts the
     solid).
+14. **Pins** (`cutter._pin_prints`, `geometry/pins.py`): every pin cut gets a `PinPlate`: its pins
+    plus 2 spares, each lying on a flat side, in rows at most 170 mm wide (a warning when larger),
+    built with `Manifold.compose` (disjoint copies, no boolean). Every distinct pin (`PinSpec`: d,
+    grip = 2T, hole clearance, preload) gets one `FitTest`: two 24 mm squares at the cut's T with
+    one hole, split last, and one pin. Each pin is checked once (`pin_ok`: watertight after export
+    and reload, one body, genus 0); each file is checked for watertightness (`_prints_ok`). The pin
+    solid: head, neck, shaft and barbs are convex hulls of circles with a half-step phase, sharing
+    their end rings exactly; each barb is clipped inside the slot; the flats cut the whole pin; the
+    V slot (widths from `slot_rule`: the barb end as wide as printing allows, the head end as narrow
+    as the strain rule allows) is turned into place by a rotation. Pins are never parts.
+    `_sideways` warns when a pin cut's holes print sideways in parts that lie on another cut's face.
 
 ### Pitfalls (found the hard way; keep them)
 
@@ -387,6 +426,19 @@ Then, once for all cuts (`cutter.generate`):
   `dirty` and `covered` checks fail when they have no probes, instead of passing. A volume check
   past a planar mold edge found an overhang the probes missed
   (`test_flange_is_flush_with_a_slanted_mold_edge`).
+- **Pins are never Parts.** They have their own lists, routes and ZIP entries; a pin file is the one
+  multi-body STL, every body on z = 0. Keep `pin_fit` on the full four-layer stack: a pin is made for
+  2T and is loose where an end cut thins the flange.
+- **Pin solids**: half-step ring phase (no vertex on a flat or slot plane), consecutive hulls share
+  rings exactly, the barb clip lies inside the slot, the slot is turned by a rotation (never a
+  mirror); the hole's joint bevel keeps a 0.1 mm band across the plane (no face on it).
+- **Test each flange face on its own.** One shadow for both faces would let a pin's insert room on
+  the head side count on the barb side. And `_cs_to_shapely` is even-odd: a region can lie in
+  another region's hole (a narrowing wall's far band).
+- **A hidden page field is force-cleared** (`setField(…, true)` in `panel.js`), or a red value in a
+  field that does not apply blocks Generate.
+- **The slot rule costs about 0.1 s** per new (d, grip, preload); `slot_rule`, `mechanics`,
+  `pin_solid` and `pin_ok` are cached.
 - **trimesh 5** `fix_normals()` silently needs scipy; call the repair steps one by one.
 - **trimesh caches** re-hash the whole mesh on every access to `face_normals` and `bounds`; the
   model keeps plain copies.
@@ -433,6 +485,18 @@ Then, once for all cuts (`cutter.generate`):
   leave a sliver of flange up to about 2 mm past the edge: 9 mm³ on one of its 24 cuts.
 - **No wedge fill within W of the mold's edge**: there, only the 0.6 mm strip reaches into the
   wall.
+- **Printed pins are beam theory only** (±30 % on forces; nothing printed before the field test,
+  docs/ACCEPTANCE.md A11): prongs may crack in a cold room or the catch slip earlier. Printed hole
+  sizes vary by printer: the fit test and Extra pin hole size. The 8 mm push room on the head side is
+  an estimate: on curved molds many pins of Inside flanges get `pin_no_room`.
+- **Pin holes printed sideways** (in parts that lie on another cut's face) come out a little tight: a
+  warning only.
+- **Pin files deeper than 170 mm** are not split: a warning, the user prints them in batches.
+- **A wall that is square at the cut but curves away within the flange thickness**: the wedge fill is
+  decided at the cut, so at T 6 (pins, or M6 bolts) the outer layer can stand 0.75-1.75 mm off such a
+  wall (the test mask: covered 0.894 against 0.999 at T 4).
+- **Bolt cuts that are blocked at every step** keep their first step (decision 16); only pin cuts
+  keep the least blocked one (decision 71).
 - **A cut closer to the mold's edge than the flange half's thickness** gets a shorter or thinner
   flange there (step 4).
 
@@ -468,6 +532,13 @@ as in 1.0.1 apart from the end cuts and the label-noise fill (`_fill_gaps`, abou
 on two real molds); on the six real molds the preview took 0.81 s (median) and at
 most 3.0 s on that laptop (validation run of 1.0.2).
 
+Version 1.1.0 (pins): a preview costs about 0.1 s more once per new pin (the slot rule, then
+cached); a pin cut's section gets four shadows (both faces over the tool clearance and over the
+insert room, 25-171 ms at 32,000-416,000 triangles) against two for bolts (12-66 ms, as the one
+shadow of 1.0.2). Generate builds a pin file in about 70 ms for 10 pins and 0.4-0.5 s for 102 pins,
+plus the fit test. A change of the tool clearance, the pin diameter or the preload adds shadows to
+the cached section instead of recomputing it.
+
 Each cut's section is cached on the model, so moving one cut recomputes only that cut's section;
 the other cuts are laid out again from their cached sections. The page shows a progress bar during
 Generate (`/api/progress`).
@@ -479,5 +550,11 @@ Generate (`/api/progress`).
 - **Fastening type**: add a `Fastening` to `FASTENINGS` (label, help, washers per bolt), give it
   a grip rule in `bolts.bolt_length()`, and, if it changes the solid, its cutters in
   `cutter._fastening_cutters()`. The page reads the list from `/api/bolts`.
-- **Parameter**: add a `Param` to `PARAMS` (label, unit, range, default, help); the page builds
-  the field from the metadata; use the value in `bolts.derive()`.
+- **Parameter**: add a `Param` to `PARAMS` (label, unit, range, default, help, `kinds`); the page
+  builds the field from the metadata and hides it for the fasteners not in `kinds`; use the value in
+  `bolts.derive()`.
+- **Printed fastener** (the snap pin is the example): its parameters with `kinds`; a branch in
+  `bolts.derive()` that returns a `Derived` with its own spec (`pin`) and `bolt`/`fastening` None;
+  a catalog entry; its solids in their own module; its hole cutter in `cutter._fastening_cutters()`;
+  its tool heights in `cutter._tool_heights()`; its prints in `cutter.generate()` and `Result`; routes
+  and ZIP entries in `server.py`; its words in `panel.js` (`WORDS`) and in the report.

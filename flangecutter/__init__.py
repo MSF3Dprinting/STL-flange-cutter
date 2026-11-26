@@ -1,4 +1,4 @@
-"""Flange Cutter: cut thin-walled mold STLs and add a bolted flange along every cut."""
+"""Flange Cutter: cut thin-walled mold STLs and add a flange, held by bolts or printed pins, along every cut."""
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 APP_NAME = "Flange Cutter"
