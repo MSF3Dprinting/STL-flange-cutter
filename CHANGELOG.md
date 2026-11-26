@@ -2,6 +2,36 @@
 
 All notable changes to Flange Cutter. Versions follow [semantic versioning](https://semver.org/).
 
+## 1.1.0 (2026-11-26)
+
+Printed snap pins, for projects that have no bolts and nuts.
+
+- New **Pin** button next to the bolt sizes (the row is now "Bolt size or pin"). With Pin, Flange
+  Cutter makes printed snap pins instead of bolts: you need no bolts, nuts or washers. Each pin goes
+  through both flanges; its head rests on one flange and its barbs click in behind the other, pulling
+  the two parts together without play.
+- Pin diameter 8 to 12 mm (8 mm normal). The flange is 6 mm thick by default with pins (8 mm for the
+  largest pins). The holes get a small bevel on the side you push the pins in from ("Pin heads on").
+- Generate makes, for every cut with pins, a pin file with the pins it needs plus 2 spares, and for
+  every pin size a small fit test: two flange squares with one hole, and one pin. Make the fit test
+  first; the manual and `report.txt` say which setting to change if the pin is too tight or too loose
+  (Extra pin hole size, Pin preload, in Advanced).
+- Every cut chooses bolts or pins on its own. The hardware list says "Nothing to buy" when every cut
+  uses pins.
+- New warnings for pins: the flange is too thin for the pins, the pins hold less in this flange, the
+  pin head does not sit on full-thickness flange, the wall leaves no room to push the pins in (those
+  pins are red in the 2D view; the warning names the other head side when that would work), the pin
+  holes print sideways, and the pin file is large.
+- Settings files with pins open in 1.0.x with the notice "cut N bolt size" and use M4 bolts there;
+  remembered settings with pins become M4 bolts in 1.0.x without a notice.
+
+Also for bolts:
+
+- The tool check now also sees a wall that narrows past the cut (inside flanges on cones and similar
+  walls), so a few bolt lines move out or get "the wall blocks the tool space" (on six real molds:
+  1 cut of 118).
+- The cut list says "1 bolt" instead of "1 bolts".
+
 ## 1.0.2 (2026-11-19)
 
 Fixes from the second test with real face-mask (TFO) molds.

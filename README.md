@@ -1,8 +1,9 @@
 # Flange Cutter
 
 A small local app for MSF 3D printing users. It cuts thin-walled mold STLs (2 to 3 mm walls) with
-one or more planes and adds a **bolted flange** along every cut, on one face of the wall only, so
-the mold surface stays clean. It exports one print-ready STL per part and a hardware list.
+one or more planes and adds a **flange** along every cut, on one face of the wall only, so the mold
+surface stays clean. The flanges are held by bolts or by printed snap pins. It exports one print-ready
+STL per part, and a hardware list or the pins to print.
 
 - Runs on Windows laptops without admin rights, fully offline, on `127.0.0.1` only.
 - Python (Flask + manifold3d + shapely + trimesh) does the geometry; one web page with three.js in
@@ -52,12 +53,18 @@ use another folder. Development also works on Linux and macOS (`python3.12 -m ve
   top of the mold, the fill across the start of a ring, a rounded edge and an edge that is square,
   rounded and a knife edge in turn (both found from the wall direction, with clean cuts through
   them), bodies found the first time keeping their labels, and the warning for a mold without an
-  edge. Also the STL export's needle merge (it never opens the surface). The test molds are in
-  `tests/demo_mold.py`.
-- `tests/test_api.py`: the API through Flask's test client, the single-instance lock, and the
-  launcher closing another running version when the user asks.
+  edge. Also the STL export's needle merge (it never opens the surface). Printed pins: the derived
+  values, every pin the settings allow is one printable body, the slot rule, the pin in its hole
+  (only the preload zone overlaps), the pin file and the fit test, pin cuts on the demo mold and the
+  test mask, the full flange under every pin, pin and bolt cuts crossing (sideways holes), two pin
+  cuts, the room to push pins in, a narrowing wall's tool space, and the step kept when every step
+  is blocked. The test molds are in `tests/demo_mold.py`.
+- `tests/test_api.py`: the API through Flask's test client (also the pin flow: pin files, fit tests,
+  ZIP, settings), the single-instance lock, and the launcher closing another running version when the
+  user asks.
 - `tests/test_ui.py`: Playwright with headless Chromium: open, cut, generate, download, two cuts,
-  settings, and fragile UI paths (for example which cut a click in the 3D view selects). To refresh
+  settings, the Pin button (pin words, hidden fields, pin files, Reset), and fragile UI paths (for
+  example which cut a click in the 3D view selects). To refresh
   the manual's screenshots in `docs/screenshots/`:
   `$env:FLANGECUTTER_SHOTS = "1"` before running it.
 
@@ -120,7 +127,8 @@ flangecutter/
   geometry/
     bolts.py           ISO data, fastening registry, parameters, bolt length rule
     mesh_io.py         load, repair and check STL, label its surfaces; write STL (cleaned up) and ZIP
-    cutter.py          sections, flanges, bolts, crossing cuts, 3D build, parts, reports
+    cutter.py          sections, flanges, bolts and pins, crossing cuts, 3D build, parts, reports
+    pins.py            printed snap pin: sizes, slot rule, solid, pin file, hole cutter, fit test
   static/              index.html, app.css, js/ (main, viewer, panel, cutview, api), vendor/three/
 samples/demo_mold.stl  the proof of concept's test mold
 reference/             the proof of concept (do not change)
@@ -142,23 +150,28 @@ build/                 build_windows.ps1 (portable ZIP), flangecutter.spec (PyIn
    outward surfaces (Outside) or the inward ones (Inside), plus 0.6 mm into the wall, and more where
    the wall leans away from the flange by more than 8°. Each half of the flange is two layers, and
    each layer is trimmed at both of its faces: the flange stays 0.1 mm off the other face and ends
-   flush and square with the mold's edge at every layer. Bolts are spaced by arc length along a line
-   offset from the wall, kept clear of other cuts, and the bolt line moves outward when the wall
-   would block a tool.
-3. Generate unites the mold with every flange slab, drills the holes and nut pockets, and only then
-   splits by every plane. Each piece is checked, named A, B, C…, laid on a cut face and exported.
+   flush and square with the mold's edge at every layer. Bolts (or pins) are spaced by arc length
+   along a line offset from the wall, kept clear of other cuts, and the bolt line moves outward when
+   the wall would block a tool (for pins also the room to push them in from the head side).
+3. Generate unites the mold with every flange slab, drills the holes and nut pockets (or pin holes),
+   and only then splits by every plane. Each piece is checked, named A, B, C…, laid on a cut face and
+   exported. Pin cuts also get a pin file (the pins lying flat, plus 2 spares) and a fit test.
 
 Details, the API and the pitfalls are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Add a bolt size, a fastening type or a parameter
+## Add a bolt size, a fastening type, a printed fastener or a parameter
 
 - **Bolt size**: add one `Bolt(...)` line to `BOLTS` in `flangecutter/geometry/bolts.py` (ISO 273
   hole, ISO 7089 washer, ISO 4032 nut). The page reads the list from `/api/bolts`.
 - **Fastening type**: add a `Fastening` to `FASTENINGS` in `bolts.py` (label, help, washers per
   bolt); give it a grip rule in `bolts.bolt_length()`; if it changes the solid, add its cutters in
   `cutter._fastening_cutters()`. The page offers it automatically.
+- **Printed fastener**: see "Extending" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (the snap
+  pin is the example: `pins.py`, a derive branch, a catalog entry, `_fastening_cutters`,
+  `_tool_heights`, `Result.pins`, routes and ZIP in `server.py`, words in `panel.js`).
 - **Parameter**: add a `Param` to `PARAMS` in `bolts.py` (label, unit, range, default, help, advanced
-  or not); use it in `bolts.derive()`. The page builds the field, its range and its tooltip from it.
+  or not, and the fasteners that use it: `kinds`); use it in `bolts.derive()`. The page builds the
+  field, its range and its tooltip from it, and hides it for the other fasteners.
 
 Add a test for every new option in `tests/test_geometry.py`.
 
@@ -199,8 +212,15 @@ Add a test for every new option in `tests/test_geometry.py`.
   wall.
 - A cut closer to the mold's edge than the flange thickness gets a shorter or thinner flange there;
   the warnings then say that bolts or washers do not fit, or that a part is not bolted.
+- Printed pins: the forces (push in, pull out) come from a beam model, about ±30 %, and nothing was
+  printed before the field test (docs/ACCEPTANCE.md, A11). A pin goes in only along its axis from its
+  head side and needs about 25 mm of free space there: on curved molds many pins of Inside flanges get
+  the warning "no room to push the pins in". Pin holes that print sideways (in parts that lie on
+  another cut's face) come out a little tight. Pin files are not split for small printers (a warning
+  above 170 mm).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). three.js (MIT) is included unchanged in
+MIT, see [LICENSE](LICENSE). The printed pin follows the shape of the "Pin" model on Printables
+(https://www.printables.com/model/16147-pin), re-created with new proportions (decision 58). three.js (MIT) is included unchanged in
 `flangecutter/static/vendor/three/` with its own license file.

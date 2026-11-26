@@ -103,20 +103,25 @@
       </fieldset>
 
       <fieldset class="step" id="step-bolts" disabled>
-        <legend><span class="num">4</span>Bolts and flange<span class="for-cut"></span></legend>
-        <div class="choice">
-          <span class="label">Bolt size</span>
-          <div class="seg" id="bolt-sizes"></div>
+        <legend><span class="num">4</span><span id="bolts-title">Bolts and flange</span><span class="for-cut"></span></legend>
+        <div class="choice stacked" id="fastener-field">
+          <span class="label" id="fastener-label">Bolt size or pin</span>
+          <div class="segs" role="radiogroup" aria-labelledby="fastener-label">
+            <div class="seg" id="bolt-sizes"></div>
+            <div class="seg" id="pin-choice"></div>
+          </div>
         </div>
+        <p class="note" id="pin-note" hidden>Printed snap pins: you need no bolts, nuts or washers. Flange Cutter makes the pin files with the parts.</p>
+        <div id="pin-params"></div>
         <div class="choice">
-          <span class="label">Bolts</span>
+          <span class="label" id="dist-label">Bolts</span>
           <div class="seg">
-            <label title="Choose how many bolts this cut gets"><input type="radio" name="dist" value="count">Number of bolts</label>
-            <label title="Choose the distance between bolts"><input type="radio" name="dist" value="spacing">Spacing</label>
+            <label id="dist-count" title="Choose how many bolts this cut gets"><input type="radio" name="dist" value="count"><span id="dist-count-text">Number of bolts</span></label>
+            <label id="dist-spacing" title="Choose the distance between bolts"><input type="radio" name="dist" value="spacing">Spacing</label>
           </div>
         </div>
         <div class="field" id="count-field" title="How many bolts this cut gets, spread evenly along the flange.">
-          <label for="count">Number of bolts<span class="range" id="count-range"></span></label>
+          <label for="count"><span id="count-text">Number of bolts</span><span class="range" id="count-range"></span></label>
           <input type="text" inputmode="numeric" autocomplete="off" class="number" id="count" data-step="1">
           <button type="button" id="suggest" title="About one bolt every 50 mm">Suggest</button>
         </div>
@@ -125,12 +130,12 @@
           <input type="text" inputmode="decimal" autocomplete="off" class="number" id="spacing" data-step="5">
           <span class="unit">mm</span>
         </div>
-        <div class="choice">
+        <div class="choice" id="fastening-field">
           <span class="label">Fastening</span>
           <div class="seg" id="fastenings"></div>
         </div>
         <div class="choice" id="pocket-field" hidden>
-          <span class="label">Nut pockets on</span>
+          <span class="label" id="pocket-label">Nut pockets on</span>
           <div class="seg">
             <label title="The part on the side the arrow points to"><input type="radio" name="pocket" value="A">Arrow side</label>
             <label title="The part on the other side"><input type="radio" name="pocket" value="B">Other side</label>
@@ -161,10 +166,14 @@
         <div id="results" hidden>
           <h3>Parts</h3>
           <table class="table">
-            <thead><tr><th>Part</th><th>Size</th><th>On the print sheet</th><th>Bolts</th></tr></thead>
+            <thead><tr><th>Part</th><th>Size</th><th>On the print sheet</th><th id="parts-fastener">Bolts</th></tr></thead>
             <tbody id="parts-body"></tbody>
           </table>
+          <h3 id="pins-title" hidden>Pins to print</h3>
+          <table class="table" id="pins-table" hidden><tbody id="pins-body"></tbody></table>
+          <p class="note" id="pins-note" hidden>Print the fit test first: its pin must click in and hold the two squares together.</p>
           <h3>Hardware</h3>
+          <p id="hardware-none" class="muted" hidden>Nothing to buy.</p>
           <table class="table"><tbody id="hardware-body"></tbody></table>
           <ul id="joins" class="joins"></ul>
           <div id="downloads" class="row wrap"></div>
@@ -182,10 +191,11 @@
       <p id="cutview-msg"></p>
       <svg id="cutview-svg" role="img" aria-label="Drawing of the selected cut"></svg>
       <p class="legend"><span class="key section"></span>Wall <span class="key flange"></span>Flange
-        <span class="key hole"></span>Bolt hole <span class="key washer"></span>Washer
-        <span class="key boltline"></span>Bolt line
-        <span id="key-noroom" title="Another cut is too close here" hidden><span class="key noroom"></span>No room for bolts</span>
-        <span id="key-blocked" title="The wall is in the way of a tool for this bolt" hidden><span class="key blocked"></span>Blocked bolt</span></p>
+        <span class="key hole"></span><span data-bolt="Bolt hole" data-pin="Pin hole">Bolt hole</span>
+        <span class="key washer"></span><span data-bolt="Washer" data-pin="Pin head">Washer</span>
+        <span class="key boltline"></span><span data-bolt="Bolt line" data-pin="Pin line">Bolt line</span>
+        <span id="key-noroom" title="Another cut is too close here" hidden><span class="key noroom"></span><span data-bolt="No room for bolts" data-pin="No room for pins">No room for bolts</span></span>
+        <span id="key-blocked" title="The wall is in the way of a tool for this bolt" hidden><span class="key blocked"></span><span data-bolt="Blocked bolt" data-pin="Blocked pin">Blocked bolt</span></span></p>
     </section>
   </aside>
 </main>

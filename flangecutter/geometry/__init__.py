@@ -2,7 +2,8 @@
 
 - bolts.py   ISO data, fastening types, parameter metadata, derived defaults
 - mesh_io.py load, check and repair STL files; write STL and ZIP
-- cutter.py  cut planes, flange outlines, bolts, 3D build, checks
+- cutter.py  cut planes, flange outlines, bolts and pins, 3D build, checks
+- pins.py    printed snap pin: sizes, slot rule, solid, pin file, hole cutter, fit test
 """
 
 

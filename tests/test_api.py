@@ -18,6 +18,10 @@ LENGTHWISE = {"plane": {"origin": [0, 0, 120], "normal": [0, 1, 0], "x_axis": [1
               "side": "outside", "bolt": "M4", "count": 8, "fastening": "through_nut", "nut_pocket_half": "B",
               "params": {"thickness": None, "width": None, "wall_gap": 1.0, "edge": 2.0, "hole_clearance": 0.2,
                          "overlap": 0.6, "max_wall_angle": 25, "tool_clearance": 12}}
+# pins with the fit values off their defaults, and bolt values that must not leak into a pin cut
+PINS = dict(LENGTHWISE, bolt="pin", params=dict(LENGTHWISE["params"], pin_diameter=8, pin_hole_clearance=0.3,
+                                                pin_preload=0.3, hole_diameter=5.0, hole_clearance=1.0))
+ACROSS = {"plane": {"origin": [0, 0, 120], "normal": [0, 0, 1], "x_axis": [1, 0, 0]}, "count": 6, "bolt": "pin"}
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +58,15 @@ def test_ping_and_catalog(client):
     assert {f["key"] for f in cat["fastenings"]} == {"through_nut", "nut_pocket"}
     assert {p["key"] for p in cat["params"]} >= {"thickness", "width", "hole_diameter", "tool_clearance"}
     assert cat["bolts"][1]["auto"] == {"thickness": 4.0, "bolt_line": 5.5, "width": 12.0, "hole_diameter": 4.7}
+    pin = cat["pin"]
+    assert (pin["key"], pin["label"], pin["spares"], pin["suggest_pitch"]) == ("pin", "Pin", 2, 35)
+    assert pin["auto"] == {"thickness": 6.0, "bolt_line": 7.0, "width": 15.0, "hole_diameter": 8.1}
+    params = {p["key"]: p for p in cat["params"]}
+    d = params["pin_diameter"]
+    assert (d["min"], d["max"], d["default"], d["kinds"], d["advanced"]) == (8, 12, 8.0, ["pin"], False)
+    assert params["pin_hole_clearance"]["label"] == "Extra pin hole size"
+    assert params["hole_clearance"]["kinds"] == ["bolt"] and params["thickness"]["kinds"] == ["bolt", "pin"]
+    assert params["wall_gap"]["pin_label"] == "Gap pin head to wall" and cat["count"]["suggest_pitch"] == 50
 
 
 def test_upload_reports_the_model(client, sample_bytes):
@@ -78,6 +91,9 @@ def test_full_flow_preview_generate_download(client, model_id):
     assert [p["name"] for p in out["parts"]] == ["A", "B"]
     assert out["hardware"][0] == {"item": "Bolt", "spec": "M4 × 16 mm", "qty": 8}
     assert out["cuts"][0]["joins"] == [{"parts": ["A", "B"], "bolts": 8}]
+    assert out["pins"] == [] == out["fit_tests"] and out["cuts"][0]["kind"] == "bolt"
+    r = client.get(f"/api/result/{out['result_id']}/pins/1.stl")
+    assert r.status_code == 400 and "There are no pins for cut 1" in r.json["error"]
     for part in out["parts"]:
         r = client.get(part["url"])
         assert r.status_code == 200 and part["file"] in r.headers["Content-Disposition"]
@@ -105,6 +121,8 @@ def test_three_parallel_slices_give_valid_json(client, model_id):
     ({"model_id": "MID", "cuts": []}, 400, "at least one cut"),
     ({"model_id": "MID", "cuts": [dict(LENGTHWISE, bolt="M8")]}, 400, "unknown bolt size"),
     ({"model_id": "MID", "cuts": [dict(LENGTHWISE, count=100)]}, 400, "too many bolts"),
+    ({"model_id": "MID", "cuts": [dict(PINS, count=100)]}, 400, "too many pins"),
+    ({"model_id": "MID", "cuts": [dict(PINS, params={"pin_diameter": 20})]}, 400, "between 8 and 12"),
     ({"model_id": "MID", "cuts": [dict(LENGTHWISE, plane={"origin": [0, 0, 900], "normal": [0, 0, 1]})]}, 400,
      "does not go through the model"),
 ])
@@ -119,6 +137,57 @@ def test_preview_reports_errors_per_cut(client, model_id):
     r = client.post("/api/preview", json={"model_id": model_id, "cuts": [LENGTHWISE, away]})
     assert r.status_code == 200
     assert r.json["cuts"][0]["error"] is None and "does not go through" in r.json["cuts"][1]["error"]
+    assert r.json["cuts"][1]["derived"]["thickness"] == 4.0          # its own automatic values (decision 72)
+
+
+def test_pin_flow(client, model_id):
+    pv = strict_json(client.post("/api/preview", json={"model_id": model_id, "cuts": [PINS]}).data)["cuts"][0]
+    d = pv["derived"]
+    assert pv["error"] is None and pv["count"] == 8 and d["kind"] == "pin"
+    assert (d["thickness"], d["bolt_line"], d["width"], d["hole_diameter"], d["washer"]) == (6.0, 7.0, 15.0, 8.3, 12.0)
+    gen = client.post("/api/generate", json={"model_id": model_id, "cuts": [PINS]})
+    assert gen.status_code == 200, gen.json
+    out = strict_json(gen.data)
+    assert out["hardware"] == []
+    c = out["cuts"][0]
+    assert (c["kind"], c["bolts"], c["nuts"], c["washers"], c["hole_diameter"]) == ("pin", 8, 0, 0, 8.3)
+    assert {"diameter": 8.0, "length": 16.93, "head_side": "B", "push_from": ["B"], "needed": 8, "spares": 2,
+            "count": 10}.items() <= c["pin"].items()
+    assert c["joins"] == [{"parts": ["A", "B"], "bolts": 8}]
+    assert [p["pins"] for p in out["parts"]] == [8, 8] and [p["bolts"] for p in out["parts"]] == [0, 0]
+    (pins,) = out["pins"]
+    assert pins["file"] == "demo_mold_pins_cut_1.stl" and pins["url"].endswith("/pins/1.stl")
+    assert (pins["count"], pins["length"], pins["hole_diameter"], pins["same_as"]) == (10, 16.93, 8.3, None)
+    r = client.get(pins["url"])
+    assert r.status_code == 200 and pins["file"] in r.headers["Content-Disposition"]
+    tm = reload_stl(r.data)
+    assert tm.is_watertight and len(tm.split(only_watertight=False)) == 10 and abs(tm.bounds[0][2]) < 1e-6
+    (fit,) = out["fit_tests"]
+    assert fit["cuts"] == [1] and fit["hole_diameter"] == 8.3 and fit["file"] == "demo_mold_fit_test_cut_1.stl"
+    tm = reload_stl(client.get(fit["url"]).data)
+    assert tm.is_watertight and len(tm.split(only_watertight=False)) == 3
+    z = zipfile.ZipFile(io.BytesIO(client.get(out["zip"]).data))
+    assert set(z.namelist()) == {"demo_mold_part_A.stl", "demo_mold_part_B.stl", "demo_mold_pins_cut_1.stl",
+                                 "demo_mold_fit_test_cut_1.stl", "report.txt", "settings.json"}
+    settings = json.loads(z.read("settings.json"))
+    saved = settings["cuts"][0]
+    assert saved["bolt"] == "pin" and saved["params"]["pin_diameter"] == 8.0 and saved["params"]["pin_preload"] == 0.3
+    again = client.post("/api/preview", json={"model_id": model_id, "cuts": settings["cuts"]}).json["cuts"][0]
+    assert again["derived"]["kind"] == "pin" and again["derived"]["hole_diameter"] == 8.3
+    report = z.read("report.txt").decode("utf-8")
+    assert "demo_mold_pins_cut_1.stl" in report and "pushed in from part B" in report and "The fit test" in report
+    r = client.get(f"/api/result/{out['result_id']}/fit/2.stl")
+    assert r.status_code == 400 and "There is no fit test for cut 2" in r.json["error"]
+
+
+def test_two_pin_cuts_api(client, model_id):
+    out = client.post("/api/generate", json={"model_id": model_id,
+                                             "cuts": [dict(PINS, params=LENGTHWISE["params"]), ACROSS]}).json
+    z = zipfile.ZipFile(io.BytesIO(client.get(out["zip"]).data))
+    assert {"demo_mold_pins_cut_1.stl", "demo_mold_pins_cut_2.stl", "demo_mold_fit_test_cut_1.stl"} <= set(z.namelist())
+    assert not any("fit_test_cut_2" in n for n in z.namelist())
+    assert out["fit_tests"][0]["cuts"] == [1, 2] and out["pins"][1]["same_as"] == 1
+    assert client.get(f"/api/result/{out['result_id']}/fit/2.stl").status_code == 400
 
 
 def test_bad_uploads(client):

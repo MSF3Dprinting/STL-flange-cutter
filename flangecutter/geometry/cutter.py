@@ -1,4 +1,4 @@
-"""Cut a mold with one or more planes and add a bolted flange along every cut.
+"""Cut a mold with one or more planes and add a flange, held by bolts or printed pins, along every cut.
 
 Port of reference/flange_cut.py (the proof of concept). Every cut is worked out in its own
 plane coordinates (cut plane = z 0, cut normal = +z):
@@ -32,9 +32,9 @@ from shapely.geometry import LineString, Point, Polygon, box
 from shapely.geometry.polygon import orient
 from shapely.ops import linemerge, substring, unary_union
 
-from . import CutError, warning
-from .bolts import (BOLTS, COUNT_RANGE, DEFAULT_SPACING, FASTENINGS, MAX_CUTS, SPACING_RANGE,
-                    SUGGEST_PITCH, Derived, check_params, derive)
+from . import CutError, pins, warning
+from .bolts import (BOLTS, COUNT_RANGE, DEFAULT_SPACING, FASTENINGS, MAX_CUTS, PIN_KEY, PIN_SPARES,
+                    SPACING_RANGE, Derived, check_params, derive)
 from .mesh_io import OTHER, RIM, Model, stl_bytes
 
 SIDES = ("outside", "inside")
@@ -54,6 +54,7 @@ MIN_CROSS_DEG, SHALLOW_DEG = 15.0, 30.0
 SMALL_PART_CM3, MOSTLY_FLANGE = 0.5, 0.25
 OVERHANG_NZ = -math.cos(math.radians(45))   # faces looking down more steeply than 45 deg need support
 FLIP = np.diag([1.0, -1.0, -1.0, 1.0])     # 180 deg about the plane x axis (print position of side B)
+SIDEWAYS_COS = math.cos(math.radians(30))  # pin holes more than 30 deg off upright print sideways
 Progress = Callable[[str, float], None]
 
 
@@ -137,7 +138,7 @@ class Cut:
     mode: str            # "count" or "spacing"
     count: int
     spacing: float
-    pocket_half: str     # "A" or "B": which side of this cut holds the nut pockets
+    pocket_half: str     # "A" or "B": nut pockets (bolts) or pin heads (pins) on this side
     settings: dict       # normalised copy for settings.json
 
     @property
@@ -175,7 +176,8 @@ def _parse_cut(r: dict, i: int) -> Cut:
             raise CutError(f"{label}: {exc.message[0].lower()}{exc.message[1:]}", exc.detail) from None
         raise CutError(f"{label}: the cut plane is not valid.", repr(pl)) from None
     side = _pick(r.get("side", "outside"), SIDES, "flange side", label)
-    bolt = _pick(r.get("bolt", "M4"), BOLTS, "bolt size", label)
+    bolt = _pick(r.get("bolt", "M4"), (*BOLTS, PIN_KEY), "bolt size", label)
+    kind = noun = "pin" if bolt == PIN_KEY else "bolt"
     fastening = _pick(r.get("fastening", "through_nut"), FASTENINGS, "fastening", label)
     half = _pick(r.get("nut_pocket_half", "B"), ("A", "B"), "nut pocket side", label)
     dist = r.get("distribution") or {}
@@ -184,13 +186,13 @@ def _parse_cut(r: dict, i: int) -> Cut:
         count = int(dist.get("count", r.get("count", 8)))
         spacing = float(dist.get("spacing", DEFAULT_SPACING))
     except (TypeError, ValueError):
-        raise CutError(f"{label}: the bolt count and spacing must be numbers.") from None
+        raise CutError(f"{label}: the {noun} count and spacing must be numbers.") from None
     if not COUNT_RANGE[0] <= count <= COUNT_RANGE[1]:
-        raise CutError(f"{label}: the bolt count must be between {COUNT_RANGE[0]} and {COUNT_RANGE[1]}.")
+        raise CutError(f"{label}: the {noun} count must be between {COUNT_RANGE[0]} and {COUNT_RANGE[1]}.")
     if not SPACING_RANGE[0] <= spacing <= SPACING_RANGE[1]:
-        raise CutError(f"{label}: the bolt spacing must be between {SPACING_RANGE[0]:g} and "
+        raise CutError(f"{label}: the {noun} spacing must be between {SPACING_RANGE[0]:g} and "
                        f"{SPACING_RANGE[1]:g} mm.")
-    params = check_params(r.get("params"), label)
+    params = check_params(r.get("params"), label, kind)
     settings = {"plane": {"origin": plane.origin.tolist(), "normal": plane.normal.tolist(),
                           "x_axis": plane.R[0].tolist()},
                 "side": side, "bolt": bolt, "fastening": fastening, "nut_pocket_half": half,
@@ -200,15 +202,14 @@ def _parse_cut(r: dict, i: int) -> Cut:
 
 # ---------------------------------------------------------------- 2D helpers (from the POC)
 def _cs_to_shapely(cs: CrossSection):
-    pos, neg = [], []
+    """Every ring XORed in (even-odd). Manifold's rings never cross, so this is the exact region, also where
+    one region lies in another region's hole (a wall that narrows past the cut projects its far band into the
+    hole of the near band; 1.0.2's outer rings minus holes lost it, decision 70)."""
+    g = Polygon()
     for p in cs.to_polygons():
-        p = np.asarray(p)
-        if len(p) < 3:
-            continue
-        a = 0.5 * np.sum(p[:, 0] * np.roll(p[:, 1], -1) - np.roll(p[:, 0], -1) * p[:, 1])
-        (pos if a > 0 else neg).append(Polygon(p).buffer(0))
-    g = unary_union(pos)
-    return g.difference(unary_union(neg)) if neg else g
+        if len(p) >= 3:
+            g = g.symmetric_difference(Polygon(np.asarray(p)).buffer(0))
+    return g
 
 
 def _shapely_to_cs(g) -> CrossSection:
@@ -332,7 +333,8 @@ def _swept_band(p: np.ndarray, s: float, dist: float, join: str = "round"):
 # ---------------------------------------------------------------- 1. section
 @dataclass
 class Section:
-    """What one plane sees of the mold. Cached per model, plane, side, thickness and tool clearance."""
+    """What one plane sees of the mold. Cached per model, plane, side and thickness; the tool shadows are
+    added per flange face and height as cuts need them (_add_shadows)."""
 
     plane: Plane
     area: object                 # shapely geometry of the wall section
@@ -348,20 +350,65 @@ class Section:
                                  # z = +-T/2 and +-T, where the flange layers end: a leaning wall moves the
                                  # protected face there, and the mold's edge may be elsewhere (or gone)
     lean_p95: float              # 95th percentile of the flange-side wall angle from square, deg
-    shadow: object               # mold just beyond both flange faces, seen along the normal (tool space)
     outlines: dict = field(default_factory=dict)   # (T, W) -> _flange_outline result: a change of the
                                                    # bolts alone reuses it (it depends on nothing else)
     wall: float = 0.0            # the model's wall thickness estimate (mm), for the end cuts
+    shadows: dict = field(default_factory=dict)    # (half, height) -> the mold beyond one flange face
+                                                   # over that height, seen along the normal (or None)
+    tool_space: dict = field(default_factory=dict) # (h_A, h_B) -> union of the two faces' shadows
 
 
 def section(model: Model, cut: Cut) -> Section:
     d = cut.d
-    key = (tuple(cut.plane.origin), tuple(cut.plane.R.ravel()), cut.side, d.thickness, d.tool_clearance)
+    key = (tuple(cut.plane.origin), tuple(cut.plane.R.ravel()), cut.side, d.thickness)   # no tool heights
     if key not in model.cache:
         if len(model.cache) > 32:
             model.cache.pop(next(iter(model.cache)))
         model.cache[key] = _section(model, cut)
-    return model.cache[key]
+    sec = model.cache[key]
+    _add_shadows(model, sec, cut)
+    return sec
+
+
+def _tool_heights(cut: Cut) -> tuple[float, float]:
+    """How far beyond the side-A and the side-B flange face the tool space reaches (mm). Bolts: the tool
+    clearance on both. Pins go in only along their axis and only from the head side: the whole pin must stand
+    in line there and a thumb push it (PinSpec.insert_room); the barb side needs pliers to take it out."""
+    d, h = cut.d, cut.d.tool_clearance
+    if d.pin is None:
+        return h, h
+    room = max(h, d.pin.insert_room)
+    return (room, h) if cut.pocket_half == "A" else (h, room)
+
+
+def _add_shadows(model: Model, sec: Section, cut: Cut) -> None:
+    """The shadows this cut's tool test needs, made once per face and height. A pin cut also gets both faces
+    over the tool clearance and over its insert room, so pin_no_room can tell whether the other head side
+    would have room."""
+    h_a, h_b = _tool_heights(cut)
+    want = {(1, h_a), (-1, h_b)}
+    if cut.d.pin is not None:
+        h, room = cut.d.tool_clearance, max(h_a, h_b)
+        want |= {(1, h), (-1, h), (1, room), (-1, room)}
+    for half, height in want - sec.shadows.keys():
+        sec.shadows[(half, height)] = _shadow(model, sec.plane, cut.d.thickness, half, height)
+    if (h_a, h_b) not in sec.tool_space:
+        parts = [g for g in (sec.shadows[(1, h_a)], sec.shadows[(-1, h_b)]) if g is not None]
+        sec.tool_space[(h_a, h_b)] = shapely.union_all(parts) if parts else None
+
+
+def _shadow(model: Model, plane: Plane, T: float, half: int, height: float):
+    """The mold beyond one flange face (from 0.01 mm off it, over `height`), seen along the normal. The POC's
+    tool cylinder hits the mold exactly when its disc hits this shadow, so one boolean and one projection per
+    face replace a 3D boolean per bolt and per bolt-line step (decision 9). Each face on its own: one shadow
+    for both would let a pin's insert room on one face count on the other (decision 69)."""
+    if height <= 0:
+        return None
+    mp = model.manifold.transform(plane.to_plane())
+    x0, y0, _, x1, y1, _ = mp.bounding_box()
+    z0 = T + 0.01 if half > 0 else -T - 0.01 - height
+    box_ = Manifold.cube((x1 - x0 + 2, y1 - y0 + 2, height)).translate((x0 - 1, y0 - 1, z0))
+    return _cs_to_shapely((mp ^ box_).project())
 
 
 def _segments(model: Model, plane: Plane, dots: np.ndarray, z: float) -> tuple:
@@ -493,7 +540,7 @@ def _section(model: Model, cut: Cut) -> Section:
         raise CutError(f"{cut.label}: the cut is too small for a flange. Move the cut.")
     # what the flange layers meet where they end (z = +-T/2, +-T): a leaning wall moves the protected
     # face there, and the mold's edge may lie elsewhere or the wall may not reach that far
-    T, H = cut.d.thickness, cut.d.tool_clearance
+    T = cut.d.thickness
     levels = {}
     for z in (T / 2, T, -T / 2, -T):
         seg_z, n2_z, nz_z, labels_z = _segments(model, plane, dots, z)
@@ -501,20 +548,10 @@ def _section(model: Model, cut: Cut) -> Section:
                                                       cut.side, flange_signs=False, shortest_run=shortest,
                                                       gap=model.wall)
         levels[z] = (g_z, gs_z, _cs_to_shapely(mp.slice(z)), f_z, gr_z)
-    shadow = None
-    if H > 0:
-        # The POC's tool cylinder runs from 0.01 mm above each flange face over the tool clearance H.
-        # It hits the mold exactly when its disc hits the mold's shadow over that height range, so
-        # one boolean + projection per cut replaces a 3D boolean per bolt and per bolt-line step.
-        x0, y0, _, x1, y1, _ = mp.bounding_box()
-        size = (x1 - x0 + 2, y1 - y0 + 2, H)
-        boxes = (Manifold.cube(size).translate((x0 - 1, y0 - 1, T + 0.01))
-                 + Manifold.cube(size).translate((x0 - 1, y0 - 1, -T - 0.01 - H)))
-        shadow = _cs_to_shapely((mp ^ boxes).project())
     outline = np.vstack([np.asarray(r.coords) for p in polys for r in [p.exterior, *p.interiors]])
     lean = np.degrees(np.arcsin(np.clip(np.abs(nz[mask]), 0, 1)))
     return Section(plane, area, refs, plane.world(outline), f_chains, f_signs, f_nz, g_chains, g_signs, g_runs,
-                   levels, float(np.percentile(lean, 95)), shadow, wall=model.wall)
+                   levels, float(np.percentile(lean, 95)), wall=model.wall)
 
 
 # ---------------------------------------------------------------- 2. layout
@@ -545,6 +582,11 @@ class Layout:
     def faces(self) -> tuple:
         """Outlines of the flange's outer faces (side A at z = T, side B at z = -T), where washers sit."""
         return (self.flange, self.flange) if self.uniform else (self.layers[1][2], self.layers[3][2])
+
+    @property
+    def stack(self):
+        """Outline where the flange is full thickness (all four layers, -T..T): where a pin holds."""
+        return self.flange if self.uniform else shapely.intersection_all([g for _, _, g in self.layers])
 
 
 def _side_points(ch: LineString, s: float, eps: float = 0.02) -> np.ndarray:
@@ -757,10 +799,11 @@ def _flange_outline(sec: Section, d: Derived, W: float) -> tuple:
 
 
 def _clear_of_others(cut: Cut, plane: Plane, line: LineString, others: list[Cut]) -> tuple:
-    """Sample a bolt line and keep the points where a bolt clears every other cut.
+    """Sample a bolt (or pin) line and keep the points where a bolt clears every other cut.
 
-    A bolt's hardware and tools reach R = T + max(tool clearance, protrusion) along its own normal and
-    r = washer/2 + 0.5
+    A bolt's hardware and tools reach R = T + max(height of that side's tool space, protrusion) along its own
+    normal (the side that faces the other plane; pins need their insert room on the head side) and
+    r = washer (pin head)/2 + 0.5
     sideways. At a sample p, the closest that reaches to another plane j is
     max(0, |dist(p, P_j)| - R |cos|) - r sin  (cos, sin of the angle between the planes); it must
     stay beyond flange j (T_j) and the bolt ends, nuts and heads sticking out of it (protrusion_j).
@@ -768,13 +811,18 @@ def _clear_of_others(cut: Cut, plane: Plane, line: LineString, others: list[Cut]
     s = np.linspace(0.0, line.length, max(2, math.ceil(line.length / SAMPLE) + 1))
     p = plane.world(_sample(line, s))
     d = cut.d
-    reach = d.thickness + max(d.tool_clearance, d.protrusion)
+    h_a, h_b = _tool_heights(cut)
+    reach_a, reach_b = d.thickness + max(h_a, d.protrusion), d.thickness + max(h_b, d.protrusion)
     ok, culprits = np.ones(len(s), bool), set()
     for o in others:
-        cos = abs(float(plane.normal @ o.plane.normal))
+        c = float(plane.normal @ o.plane.normal)
+        cos = abs(c)
         sin = math.sqrt(max(0.0, 1.0 - cos * cos))
-        dist = np.abs((p - o.plane.origin) @ o.plane.normal)
-        bad = np.maximum(0.0, dist - reach * cos) - d.envelope_r * sin < o.d.thickness + o.d.protrusion + 0.5
+        signed = (p - o.plane.origin) @ o.plane.normal
+        # moving along +n_i changes the distance to plane j by c per mm: side A heads for plane j where
+        # sign(distance) * c < 0
+        reach = np.where(np.sign(signed) * c < 0, reach_a, reach_b)
+        bad = np.maximum(0.0, np.abs(signed) - reach * cos) - d.envelope_r * sin < o.d.thickness + o.d.protrusion + 0.5
         if bad.any():
             culprits.add(o.index)
             ok &= ~bad
@@ -796,7 +844,7 @@ def _bolt_lines(cut: Cut, sec: Section, c: float, others: list[Cut]) -> tuple[li
     Stretches are (line, closed, margin at start, margin at end). An open chain end keeps the POC
     end margin; a stretch end made by another cut needs none (the clearance test holds the washer).
     """
-    end = c + cut.d.bolt.washer / 2 + cut.d.end_margin
+    end = c + cut.d.footprint / 2 + cut.d.end_margin
     lines, out, culprits = [], [], set()
     for ch, sgn in zip(sec.f_chains, sec.f_signs):
         line = ch.offset_curve(sgn * c, quad_segs=16, join_style="round")
@@ -845,16 +893,21 @@ def _place_bolts(cut: Cut, pieces: list[tuple], culprits: set) -> tuple[np.ndarr
                      for (_, closed, _, _), u in zip(pieces, usable)], int)
     total_cap = int(caps.sum())
     mins = int(np.minimum(2, caps).sum())
-    suggested = int(np.clip(max(4, round(usable.clip(0).sum() / SUGGEST_PITCH)), mins, max(total_cap, mins)))
+    suggested = int(np.clip(max(4, round(usable.clip(0).sum() / d.suggest_pitch)), mins, max(total_cap, mins)))
     if cut.mode == "spacing":
         target = np.array([round(u / cut.spacing) if closed else round(u / cut.spacing) + 1
                            for (_, closed, _, _), u in zip(pieces, usable.clip(0))])
         alloc = np.clip(target, np.minimum(2, caps), caps)
     else:
         if 0 < total_cap < cut.count:
-            near = f" Other cuts keep bolts away from part of it ({_cut_names(culprits)})." if culprits else ""
-            raise CutError(f"{cut.label}: too many bolts. At most {total_cap} {d.bolt.name} bolts fit along "
-                           f"this cut, {d.min_spacing:g} mm apart.{near} Lower the bolt count.",
+            noun = d.noun
+            near = f" Other cuts keep {noun}s away from part of it ({_cut_names(culprits)})." if culprits else ""
+            if d.pin is None:
+                raise CutError(f"{cut.label}: too many bolts. At most {total_cap} {d.bolt.name} bolts fit along "
+                               f"this cut, {d.min_spacing:g} mm apart.{near} Lower the bolt count.",
+                               f"capacity per stretch {caps.tolist()}")
+            raise CutError(f"{cut.label}: too many pins. At most {total_cap} pins fit along this cut, "
+                           f"{d.min_spacing:g} mm apart.{near} Lower the number of pins.",
                            f"capacity per stretch {caps.tolist()}")
         alloc = _allocate(cut.count, usable.clip(0), caps)
     pts = []
@@ -874,23 +927,37 @@ def _cut_names(indices) -> str:
     return ", ".join(f"cut {i + 1}" for i in sorted(indices))
 
 
-def _blocked(sec: Section, d: Derived, pts: np.ndarray) -> list[int]:
-    """Bolts whose tool space beyond a flange face hits the mold (POC rule 8).
+def _blocked(sec: Section, cut: Cut, pts: np.ndarray) -> tuple[list[int], float]:
+    """Bolts or pins whose tool space beyond a flange face hits the mold (POC rule 8), and the mold area
+    inside their tool discs in all (mm2).
 
     Same cylinder as the POC, tested against the mold just beyond the flange faces instead of
     the finished halves: flange, holes and pockets never reach past |z| = T + 1, so the 3D solid
     needs to be built only once, after the bolt line has found its place.
     """
-    if sec.shadow is None or sec.shadow.is_empty or len(pts) == 0:
-        return []
-    discs = shapely.buffer(shapely.points(pts), d.envelope_r, quad_segs=16)
-    return [int(i) for i in np.flatnonzero(shapely.area(shapely.intersection(discs, sec.shadow)) > BLOCK_AREA)]
+    g = sec.tool_space.get(_tool_heights(cut))
+    if g is None or g.is_empty or len(pts) == 0:
+        return [], 0.0
+    over = shapely.area(shapely.intersection(shapely.buffer(shapely.points(pts), cut.d.envelope_r, quad_segs=16), g))
+    bad = over > BLOCK_AREA
+    return [int(i) for i in np.flatnonzero(bad)], float(over[bad].sum())
+
+
+def _over(sec: Section, pts: np.ndarray, r: float, half: int, height: float) -> np.ndarray:
+    """Area of each tool disc inside the shadow of one flange face over one height (zeros without one)."""
+    g = sec.shadows.get((half, height))
+    if g is None or g.is_empty or len(pts) == 0:
+        return np.zeros(len(pts))
+    return shapely.area(shapely.intersection(shapely.buffer(shapely.points(pts), r, quad_segs=16), g))
 
 
 def layout(cut: Cut, sec: Section, others: list[Cut]) -> Layout:
-    """Flange and bolts of one cut. Moves the bolt line out 1 mm at a time while tools are blocked."""
+    """Flange and bolts (or pins) of one cut. Moves the bolt line out 1 mm at a time while tools are blocked.
+
+    Of equal steps the first, narrowest one stays (decision 16). When every step is blocked, a pin cut keeps the
+    step with the fewest blocked pins, then the least mold in the tool discs (decision 71)."""
     d = cut.d
-    best = None
+    best, best_rank = None, None
     for k in range(GAP_STEPS + 1):
         c = d.bolt_line(k)
         lines, pieces, culprits = _bolt_lines(cut, sec, c, others)
@@ -900,9 +967,10 @@ def layout(cut: Cut, sec: Section, others: list[Cut]) -> Layout:
             if k == 0:
                 raise
             break                    # a moved bolt line got too short for the count: keep the best so far
-        blocked = _blocked(sec, d, pts)
-        if best is None or len(blocked) < len(best[3]):
-            best = (k, c, d.flange_width(c), blocked, pts, suggested, lines, pieces, empty, culprits)
+        blocked, over = _blocked(sec, cut, pts)
+        rank = (len(blocked), round(over, 1)) if d.pin is not None else (len(blocked),)
+        if best is None or rank < best_rank:
+            best, best_rank = (k, c, d.flange_width(c), blocked, pts, suggested, lines, pieces, empty, culprits), rank
         if not blocked:
             break
     k, c, W, blocked, pts, suggested, lines, pieces, empty, culprits = best
@@ -919,8 +987,10 @@ def layout(cut: Cut, sec: Section, others: list[Cut]) -> Layout:
 
 
 def _check_layout(cut: Cut, sec: Section, lay: Layout) -> None:
-    """Plain-language warnings for one cut (POC checks plus the new ones)."""
+    """Plain-language warnings for one cut (POC checks plus the new ones). Pin cuts get pin words; the bolt
+    texts stay as they were."""
     d, w, label = cut.d, lay.warnings, cut.label
+    pin, noun = d.pin is not None, d.noun
     n = len(lay.pts)
     if sec.lean_p95 > d.max_wall_angle:
         w.append(warning("wall_angle", f"{label}: the wall meets the cut at up to {sec.lean_p95:.0f}° from square.",
@@ -928,36 +998,78 @@ def _check_layout(cut: Cut, sec: Section, lay: Layout) -> None:
     if n == 0:
         why = f" because {_cut_names(lay.culprits)} {'is' if len(lay.culprits) == 1 else 'are'} too close" \
             if lay.culprits else ""
-        w.append(warning("no_bolts", f"{label}: there is no room for bolts on this cut{why}.",
-                         "Move the cuts further apart, or lower the tool clearance."))
+        action = "Move the cuts further apart, or lower the tool clearance."
+        if pin and lay.culprits:     # the head side keeps room for the whole pin, whatever the tool clearance
+            action = "Move the cuts further apart, lower the tool clearance, or try the other side under Pin heads on."
+        w.append(warning("no_bolts", f"{label}: there is no room for {noun}s on this cut{why}.", action))
         return
     if lay.empty:
         w.append(warning("unbolted_stretch", f"{label}: {lay.empty} stretch(es) of this cut are too short for a "
-                                             f"bolt, next to {_cut_names(lay.culprits) or 'the end of the flange'}.",
-                         "The parts may not be bolted there. Move the cuts so each stretch is longer."))
+                                             f"{noun}, next to {_cut_names(lay.culprits) or 'the end of the flange'}.",
+                         f"The parts may not be {'held' if pin else 'bolted'} there. Move the cuts so each stretch "
+                         "is longer."))
     if cut.mode == "count" and n > cut.count:
-        w.append(warning("count_raised", f"{label}: each separate stretch of the cut needs 2 bolts, so {n} bolts "
+        w.append(warning("count_raised", f"{label}: each separate stretch of the cut needs 2 {noun}s, so {n} {noun}s "
                                          f"are used instead of {cut.count}.", "No action needed."))
-    if lay.blocked:
+    if lay.blocked and pin:
+        _pin_room(cut, sec, lay)
+    elif lay.blocked:
         w.append(warning("bolts_blocked", f"{label}: the wall blocks the tool space at bolt "
                                           f"{_numbers(lay.blocked)}.",
                          "Move or rotate the cut, lower the tool clearance, or check that you can reach these bolts."))
     elif lay.moved > 0:
-        w.append(warning("bolt_line_moved", f"{label}: the wall flares over the flange, so the bolt line was "
+        w.append(warning("bolt_line_moved", f"{label}: the wall flares over the flange, so the {noun} line was "
                                             f"moved out to {lay.c:.1f} mm from the wall.",
                          "No action needed. The flange is wider than usual."))
     if n > 1:
         dist = np.linalg.norm(lay.pts[:, None] - lay.pts[None], axis=2) + np.eye(n) * 1e9
         if dist.min() < d.min_spacing - 1e-6:
-            w.append(warning("bolts_close", f"{label}: some bolts are only {dist.min():.1f} mm apart.",
-                             "Lower the bolt count or use a smaller bolt."))
-    discs = shapely.buffer(shapely.points(lay.pts), d.bolt.washer / 2, quad_segs=8)
+            action = ("Lower the bolt count or use a smaller bolt." if not pin else
+                      "Lower the number of pins, or choose a smaller pin diameter." if d.pin.d > 8 else
+                      "Lower the number of pins.")
+            w.append(warning("bolts_close", f"{label}: some {noun}s are only {dist.min():.1f} mm apart.", action))
+    discs = shapely.buffer(shapely.points(lay.pts), d.footprint / 2, quad_segs=8)
+    if pin:
+        # the head disc (1.5 d) holds the barb disc and the hole: the full 2T stack must lie under both (decision 63)
+        bad = shapely.intersects(discs, sec.area) | ~shapely.contains(lay.stack.buffer(0.05), discs)
+        if bad.any():
+            w.append(warning("pin_fit", f"{label}: the pin head does not sit on full-thickness flange at pin "
+                                        f"{_numbers(np.flatnonzero(bad))}.",
+                             "Those pins would be loose. Make the flange wider, or move the cut away from the "
+                             "mold's edge."))
+        return
     both = (lay.flange if lay.uniform else lay.faces[0].intersection(lay.faces[1])).buffer(0.05)  # a washer each side
     bad = shapely.intersects(discs, sec.area) | ~shapely.contains(both, discs)
     if bad.any():
         w.append(warning("washer_fit", f"{label}: the washer does not fit on the flange at bolt "
                                        f"{_numbers(np.flatnonzero(bad))}.",
                          "Make the flange wider, or move the cut."))
+
+
+def _pin_room(cut: Cut, sec: Section, lay: Layout) -> None:
+    """Blocked pins by cause: no room to push them in from the head side (pin_no_room; the action names the
+    other head side only when that side leaves room for every pin of the cut, and this side room for pliers),
+    or no room for pliers past the barb side (bolts_blocked). Only warnings: the user decides (decision 69)."""
+    d, w, label = cut.d, lay.warnings, cut.label
+    head = 1 if cut.pocket_half == "A" else -1
+    room, h, r = max(_tool_heights(cut)), d.tool_clearance, d.envelope_r
+    no_room = _over(sec, lay.pts, r, head, room) > BLOCK_AREA
+    if no_room.any():
+        idx = np.flatnonzero(no_room)
+        # checked for every pin, not only the blocked ones: a switch must not just move the problem
+        swap = bool((_over(sec, lay.pts, r, -head, room) <= BLOCK_AREA).all()
+                    and (_over(sec, lay.pts, r, head, h) <= BLOCK_AREA).all())
+        side = "the arrow side" if head > 0 else "the other side"
+        action = (f"Choose Pin heads on: {'Other side' if head > 0 else 'Arrow side'}, or move the cut."
+                  if swap else "Move or rotate the cut, or use bolts on this cut.")
+        w.append(warning("pin_no_room", f"{label}: the wall leaves no room to push pin {_numbers(idx)} in from "
+                                        f"{side}. A pin needs about {room:.0f} mm of free space there.", action))
+    rest = [i for i in lay.blocked if not no_room[i]]
+    if rest:
+        w.append(warning("bolts_blocked", f"{label}: the wall is in the way at pin {_numbers(rest)}. There may be "
+                                          "no room to take it out.",
+                         "Move or rotate the cut, lower the tool clearance, or check that pliers can reach these "
+                         "pins."))
 
 
 def _numbers(idx) -> str:
@@ -1083,9 +1195,13 @@ def _crossings(cut: Cut, sec: Section, lay: Layout, cuts: list[Cut]) -> list[dic
 
 
 def cut_json(cut: Cut, sec: Section | None, lay: Layout | None, error: str | None, cuts: list[Cut]) -> dict:
-    """Everything the page draws for one cut. A cut with an error has only its frame and the error."""
+    """Everything the page draws for one cut. A cut with an error has only its frame, the error and its own
+    automatic values (`derived`, for the page's placeholders: a 12 mm pin's 8 mm flange, decision 72)."""
     if error or lay is None:
-        return {"frame": cut.plane.as_json(), "error": error or "This cut could not be laid out."}
+        c0 = cut.d.bolt_line()
+        return {"frame": cut.plane.as_json(), "error": error or "This cut could not be laid out.",
+                "derived": cut.d.as_dict() | {"bolt_line": round(c0, 2), "width": round(cut.d.flange_width(c0), 2),
+                                              "moved": 0.0}}
     xyz = sec.plane.world(lay.pts) if len(lay.pts) else np.zeros((0, 3))
     derived = cut.d.as_dict() | {"bolt_line": round(lay.c, 2), "width": round(lay.W, 2), "moved": lay.moved}
     return {"frame": sec.plane.as_json(), "error": None,
@@ -1121,7 +1237,8 @@ class Part:
     explode: np.ndarray = field(default_factory=lambda: np.zeros(3))
     mold_fraction: float = 1.0
     overhang_cm2: float = 0.0
-    bolts: int = 0
+    bolts: int = 0               # bolts of bolt cuts that hold this part
+    pins: int = 0                # pins of pin cuts that hold this part
     _stl: bytes | None = None
 
     def print_solid(self) -> Manifold:
@@ -1134,12 +1251,53 @@ class Part:
 
 
 @dataclass
+class PinPlate:
+    """One cut's printed pins (needed + spares), each lying on a flat side, in print position. Never a Part:
+    no letter, no explode, no small_part check; the one multi-body STL (decision 65)."""
+
+    cut: int                     # cut index, 0-based
+    spec: pins.PinSpec
+    needed: int
+    spares: int
+    head_side: str               # "A" or "B": the side the pins go in from
+    solid: Manifold
+    _stl: bytes | None = None
+
+    @property
+    def count(self) -> int:
+        return self.needed + self.spares
+
+    def stl(self) -> bytes:
+        if self._stl is None:
+            self._stl = stl_bytes(self.solid)
+        return self._stl
+
+
+@dataclass
+class FitTest:
+    """Two flange squares with one pin hole, and one pin: print it before the mold."""
+
+    cuts: list[int]              # 0-based indices of the cuts whose pins it tests
+    spec: pins.PinSpec
+    thickness: float
+    solid: Manifold
+    _stl: bytes | None = None
+
+    def stl(self) -> bytes:
+        if self._stl is None:
+            self._stl = stl_bytes(self.solid)
+        return self._stl
+
+
+@dataclass
 class Result:
     plan: Plan
     parts: list[Part]
-    joins: list[list[tuple[str, str, int]]]      # per cut: (part, part, bolts)
+    joins: list[list[tuple[str, str, int]]]      # per cut: (part, part, bolts or pins)
     warnings: list[dict]
     seconds: float
+    pins: list[PinPlate] = field(default_factory=list)
+    fit_tests: list[FitTest] = field(default_factory=list)
 
     @property
     def cuts(self) -> list[Cut]:
@@ -1184,10 +1342,13 @@ def _flange_solid(cut: Cut, lay: Layout) -> Manifold:
 
 
 def _fastening_cutters(cut: Cut, lay: Layout) -> Manifold | None:
-    """Bolt holes and, for nut pockets, hexagonal pockets, in plane coordinates."""
+    """Bolt holes and, for nut pockets, hexagonal pockets, or pin holes, in plane coordinates."""
     if not len(lay.pts):
         return None
     d, T = cut.d, cut.d.thickness
+    if d.pin is not None:
+        one = pins.hole_cutter(d.pin, T, 1 if cut.pocket_half == "A" else -1)
+        return Manifold.batch_boolean([one.translate((x, y, 0.0)) for x, y in lay.pts], OpType.Add)
     tools = [Manifold.cylinder(2 * T + 2, d.hole_d / 2, -1, 48, True).translate((x, y, 0.0)) for x, y in lay.pts]
     if d.fastening.nut_pocket:
         # pocket from the outer face of the chosen side's flange, 1 mm past it for a clean cut;
@@ -1272,7 +1433,8 @@ def generate(model: Model, cuts: list[Cut], progress: Progress | None = None) ->
         if tools is not None:
             subs.append(tools.transform(s.plane.to_world()))
     solid = Manifold.batch_boolean(adds, OpType.Add)
-    step("Drilling the bolt holes", 0.45)
+    any_pins = any(c.d.pin is not None for c in cuts)
+    step("Drilling the holes" if any_pins else "Drilling the bolt holes", 0.45)
     if subs:
         solid = solid - Manifold.batch_boolean(subs, OpType.Add)
     step("Splitting the parts", 0.6)
@@ -1317,10 +1479,79 @@ def generate(model: Model, cuts: list[Cut], progress: Progress | None = None) ->
         n = np.linalg.norm(e)
         p.explode = e / n if n > 1e-9 else np.zeros(3)
     _part_warnings(found, cuts, secs, warnings)
+    plates, tests = [], []
+    if any(c.d.pin is not None and len(lay.pts) for c, lay in zip(cuts, lays)):
+        step("Making the pins", 0.9)
+        plates, tests = _pin_prints(cuts, lays, warnings)       # at Generate, so a bad file becomes a warning
+        _sideways(found, cuts, secs, joins, warnings)
     for lay in lays:
         warnings += lay.warnings
     step("Done", 1.0)
-    return Result(pl, found, joins, warnings, time.perf_counter() - t0)
+    return Result(pl, found, joins, warnings, time.perf_counter() - t0, plates, tests)
+
+
+def _prints_ok(data: bytes) -> bool:
+    """An exported pin file or fit test reloads watertight. The body count is checked once per pin
+    (pins.pin_ok): copies placed apart by compose() cannot merge."""
+    try:
+        return bool(trimesh.load_mesh(io.BytesIO(data), file_type="stl").is_watertight)
+    except Exception:  # noqa: BLE001 - any failure means the file needs a look
+        return False
+
+
+def _pin_prints(cuts: list[Cut], lays: list, warnings: list) -> tuple[list[PinPlate], list[FitTest]]:
+    """Every pin cut's pin file (needed + PIN_SPARES), and one fit test per distinct pin."""
+    plates = []
+    for c, lay in zip(cuts, lays):
+        n = len(lay.pts)
+        if c.d.pin is None or n == 0:
+            continue
+        plate = PinPlate(c.index, c.d.pin, n, PIN_SPARES, c.pocket_half, pins.plate(c.d.pin, n + PIN_SPARES))
+        plates.append(plate)
+        x0, y0, _, x1, y1, _ = plate.solid.bounding_box()
+        if max(x1 - x0, y1 - y0) > pins.PLATE_MAX + 0.01:
+            warnings.append(warning("pin_plate_large", f"The pins of cut {c.index + 1} take {x1 - x0:.0f} × "
+                                                       f"{y1 - y0:.0f} mm on the print sheet.",
+                                    "If that is too big for your printer, print them in batches."))
+        if not (pins.pin_ok(c.d.pin) and _prints_ok(plate.stl())):
+            warnings.append(warning("pins_not_watertight", f"The pin file of cut {c.index + 1} may need a repair "
+                                                           "in your slicer.",
+                                    "Let your slicer repair it, or change the flange thickness by 0.1 mm and "
+                                    "generate again."))
+    groups: dict = {}
+    for plate in plates:                       # equal specs mean equal T (grip = 2T)
+        groups.setdefault(plate.spec, []).append(plate.cut)
+    tests = []
+    for spec, idx in groups.items():
+        T = cuts[idx[0]].d.thickness
+        ft = FitTest(idx, spec, T, pins.fit_test(spec, T))
+        tests.append(ft)
+        if not _prints_ok(ft.stl()):
+            warnings.append(warning("pins_not_watertight", f"The fit test for {_cut_names(idx)} may need a repair "
+                                                           "in your slicer.",
+                                    "Let your slicer repair it, or change the flange thickness by 0.1 mm and "
+                                    "generate again."))
+    return plates, tests
+
+
+def _sideways(parts: list[Part], cuts: list[Cut], secs: list, joins: list, warnings: list) -> None:
+    """Pin holes that print sideways: a part held by a pin cut lies on another cut's face more than 30 deg
+    off that pin cut's plane, so its pin holes are not upright on the print sheet (decision 67)."""
+    by_name = {p.name: p for p in parts}
+    for i, c in enumerate(cuts):
+        if c.d.pin is None:
+            continue
+        held = sorted({n for na, nb, k in joins[i] if k for n in (na, nb)})
+        side = [n for n in held if by_name[n].down is not None and by_name[n].down[0] != i
+                and abs(float(secs[by_name[n].down[0]].plane.normal @ secs[i].plane.normal)) < SIDEWAYS_COS]
+        if side:
+            names = side[0] if len(side) == 1 else ", ".join(side[:-1]) + " and " + side[-1]
+            warnings.append(warning("pin_holes_sideways", f"{c.label}: the pin holes print sideways in "
+                                                          f"part{'s' if len(side) > 1 else ''} {names}, so they may "
+                                                          "come out a little tight.",
+                                    "Try one pin in the first of these parts you print. If it is too tight, open "
+                                    "the hole a little (a drill bit of the pin size turned by hand, or a round "
+                                    "file), or raise Extra pin hole size in Advanced and generate again."))
 
 
 def _cut_faces(parts: list[Part], secs: list[Section]) -> list[dict]:
@@ -1341,7 +1572,7 @@ def _cut_faces(parts: list[Part], secs: list[Section]) -> list[dict]:
 
 
 def _connect(parts: list[Part], cuts: list[Cut], lays: list, all_faces: list, warnings: list) -> list:
-    """Which parts each cut bolts together, and warnings for parts or joints without bolts."""
+    """Which parts each cut bolts (or pins) together, and warnings for parts or joints without them."""
     joins, bolted = [], set()
     for i, (c, lay) in enumerate(zip(cuts, lays)):
         side = {"A": {}, "B": {}}
@@ -1350,7 +1581,7 @@ def _connect(parts: list[Part], cuts: list[Cut], lays: list, all_faces: list, wa
                 side[faces[i][1]][p.name] = faces[i][2]
         count = Counter()
         for q in lay.pts:
-            disc = Point(q).buffer(c.d.bolt.washer / 2)
+            disc = Point(q).buffer(c.d.footprint / 2)
             a = [n for n, g in side["A"].items() if g.intersects(disc)]
             b = [n for n, g in side["B"].items() if g.intersects(disc)]
             if a and b:
@@ -1360,19 +1591,24 @@ def _connect(parts: list[Part], cuts: list[Cut], lays: list, all_faces: list, wa
                 if ga.intersection(gb).area < 1.0:
                     continue
                 k = count[(na, nb)]
+                noun = c.d.noun
                 if k == 0:
                     warnings.append(warning("joint_unbolted", f"Parts {na} and {nb} touch along cut {i + 1}, but no "
-                                                              "bolt holds them together.",
-                                            "Move the cuts so this joint is longer, or use more bolts."))
+                                                              f"{noun} holds them together.",
+                                            f"Move the cuts so this joint is longer, or use more {noun}s."))
                 elif k == 1:
-                    warnings.append(warning("joint_one_bolt", f"Parts {na} and {nb} are held by only 1 bolt along "
-                                                              f"cut {i + 1}.", "Use more bolts on this cut."))
+                    warnings.append(warning("joint_one_bolt", f"Parts {na} and {nb} are held by only 1 {noun} along "
+                                                              f"cut {i + 1}.", f"Use more {noun}s on this cut."))
         joins.append([(na, nb, k) for (na, nb), k in sorted(count.items())])
         bolted |= {n for pair in count for n in pair}
+    anything = " or ".join(sorted({c.d.noun for c in cuts}))      # "bolt", "pin" or "bolt or pin"
     for p in parts:
-        p.bolts = sum(k for cut_joins in joins for na, nb, k in cut_joins if p.name in (na, nb))
+        held = [(c.d.pin is None, k) for c, cut_joins in zip(cuts, joins) for na, nb, k in cut_joins
+                if p.name in (na, nb)]
+        p.bolts = sum(k for bolt, k in held if bolt)
+        p.pins = sum(k for bolt, k in held if not bolt)
         if p.name not in bolted:
-            warnings.append(warning("part_unbolted", f"Part {p.name} is not held by any bolt.",
+            warnings.append(warning("part_unbolted", f"Part {p.name} is not held by any {anything}.",
                                     "Move the cuts: this part would be loose."))
     return joins
 
@@ -1409,11 +1645,12 @@ def _bolt_spec(c: Cut) -> str:
 
 
 def hardware(cuts: list[Cut], lays: list[Layout]) -> list[dict]:
-    """Shopping list for all cuts: bolts by size and length, nuts and washers by size."""
+    """Shopping list for all cuts: bolts by size and length, nuts and washers by size. Pin cuts buy nothing:
+    their pins are printed (Result.pins)."""
     bolts, nuts, washers = Counter(), Counter(), Counter()
     for c, lay in zip(cuts, lays):
         n = len(lay.pts)
-        if n:
+        if n and c.d.pin is None:
             bolts[_bolt_spec(c)] += n
             nuts[c.d.bolt.name] += n
             washers[c.d.bolt.name] += n * c.d.fastening.washers_per_bolt
@@ -1422,15 +1659,28 @@ def hardware(cuts: list[Cut], lays: list[Layout]) -> list[dict]:
             + [{"item": "Washer", "spec": f"{k} (ISO 7089)", "qty": v} for k, v in sorted(washers.items())])
 
 
+def _push_from(c: Cut, joins: list[tuple[str, str, int]]) -> list[str]:
+    """The parts on the head side of a pin cut's joins: the pins are pushed in from them."""
+    return sorted({a if c.pocket_half == "A" else b for a, b, k in joins if k})
+
+
 def cut_report(c: Cut, lay: Layout, joins: list[tuple[str, str, int]]) -> dict:
+    """One cut's numbers. Keys named `bolts` count the pins of a pin cut (`kind` tells which)."""
     d, n = c.d, len(lay.pts)
+    common = {"flange_thickness": round(d.thickness, 2), "flange_width": round(lay.W, 2),
+              "bolt_line": round(lay.c, 2), "bolt_line_moved": lay.moved, "hole_diameter": round(d.hole_d, 2)}
+    if d.pin is not None:
+        return {"cut": c.index + 1, "side": c.side, "bolt": PIN_KEY, "fastening": "Snap pin", "bolts": n,
+                "bolt_spec": None, "nuts": 0, "washers": 0, "nut_pockets_on": None, **common, "pocket": None,
+                "joins": [{"parts": [a, b], "bolts": k} for a, b, k in joins], "kind": "pin",
+                "pin": {"diameter": d.pin.d, "length": d.pin.length, "grip": round(d.grip, 2),
+                        "head_side": c.pocket_half, "push_from": _push_from(c, joins), "needed": n,
+                        "spares": PIN_SPARES if n else 0, "count": n + PIN_SPARES if n else 0}}
     return {"cut": c.index + 1, "side": c.side, "bolt": d.bolt.name, "fastening": d.fastening.label,
             "bolts": n, "bolt_spec": _bolt_spec(c), "nuts": n, "washers": n * d.fastening.washers_per_bolt,
-            "nut_pockets_on": c.pocket_half if d.fastening.nut_pocket else None,
-            "flange_thickness": round(d.thickness, 2), "flange_width": round(lay.W, 2),
-            "bolt_line": round(lay.c, 2), "bolt_line_moved": lay.moved, "hole_diameter": round(d.hole_d, 2),
+            "nut_pockets_on": c.pocket_half if d.fastening.nut_pocket else None, **common,
             "pocket": ({"across_flats": d.pocket_af, "depth": d.pocket_depth} if d.fastening.nut_pocket else None),
-            "joins": [{"parts": [a, b], "bolts": k} for a, b, k in joins]}
+            "joins": [{"parts": [a, b], "bolts": k} for a, b, k in joins], "kind": "bolt", "pin": None}
 
 
 def part_report(p: Part) -> dict:
@@ -1438,7 +1688,34 @@ def part_report(p: Part) -> dict:
     return {"name": p.name, "signature": p.signature, "volume_cm3": round(p.solid.volume() / 1000, 2),
             "size": (bb[3:] - bb[:3]).round(1).tolist(), "triangles": int(p.solid.num_tri()),
             "face_down": (p.down[0] + 1 if p.down else None), "cuts": [i + 1 for i in p.touches],
-            "bolts": p.bolts, "overhang_cm2": round(p.overhang_cm2, 1)}
+            "bolts": p.bolts, "pins": p.pins, "overhang_cm2": round(p.overhang_cm2, 1)}
+
+
+def _size(solid: Manifold) -> list[float]:
+    bb = np.asarray(solid.bounding_box())
+    return (bb[3:] - bb[:3]).round(1).tolist()
+
+
+def pin_report(plate: PinPlate, c: Cut, joins: list[tuple[str, str, int]], first: dict) -> dict:
+    """One cut's pin file. `same_as`: the first earlier pin cut whose pins are the same (`first` maps the pin
+    shape to that cut's number, filled in plate order)."""
+    spec = plate.spec
+    same = first.setdefault(spec.shape, plate.cut + 1)
+    return {"cut": plate.cut + 1, "count": plate.count, "needed": plate.needed, "spares": plate.spares,
+            "diameter": spec.d, "length": spec.length, "flange_thickness": round(c.d.thickness, 2),
+            "grip": round(spec.grip, 2), "hole_diameter": round(spec.hole_d, 2), "head_side": plate.head_side,
+            "push_from": _push_from(c, joins), "same_as": None if same == plate.cut + 1 else same,
+            "size": _size(plate.solid), "triangles": int(plate.solid.num_tri())}
+
+
+def fit_report(ft: FitTest) -> dict:
+    return {"cuts": [i + 1 for i in ft.cuts], "diameter": ft.spec.d, "flange_thickness": round(ft.thickness, 2),
+            "hole_diameter": round(ft.spec.hole_d, 2), "size": _size(ft.solid), "triangles": int(ft.solid.num_tri())}
+
+
+def _pin_reports(result: Result) -> list[dict]:
+    first: dict = {}
+    return [pin_report(p, result.cuts[p.cut], result.joins[p.cut], first) for p in result.pins]
 
 
 def summary(result: Result) -> dict:
@@ -1448,16 +1725,52 @@ def summary(result: Result) -> dict:
             "parts": [part_report(p) | {"to_world": np.linalg.inv(p.matrix).ravel().round(9).tolist(),
                                          "explode": p.explode.round(6).tolist()} for p in result.parts],
             "cuts": [cut_report(c, l, j) for c, l, j in zip(pl.cuts, pl.lays, result.joins)],
-            "hardware": hardware(pl.cuts, pl.lays), "warnings": result.warnings,
+            "hardware": hardware(pl.cuts, pl.lays),
+            "pins": _pin_reports(result), "fit_tests": [fit_report(f) for f in result.fit_tests],
+            "warnings": result.warnings,
             "preview": {"cuts": [cut_json(c, s, l, None, pl.cuts) for c, s, l in zip(pl.cuts, pl.secs, pl.lays)],
                         "warnings": pl.warnings}}
 
 
-def report_text(result: Result, model_name: str, sha256: str, version: str, files: dict[str, str]) -> str:
-    """report.txt for the ZIP: plain text a field user can print."""
+def _parts_phrase(names: list[str]) -> str:
+    """"part B", "parts C and D", "parts A, B and C"."""
+    if len(names) == 1:
+        return f"part {names[0]}"
+    return "parts " + ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _cuts_phrase(numbers: list[int]) -> str:
+    """"cut 1", "cuts 1 and 2", "cuts 1, 2 and 3"."""
+    if len(numbers) == 1:
+        return f"cut {numbers[0]}"
+    return "cuts " + ", ".join(str(n) for n in numbers[:-1]) + f" and {numbers[-1]}"
+
+
+def _many(n: int, noun: str) -> str:
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
+
+def report_text(result: Result, model_name: str, sha256: str, version: str, files: dict[str, str],
+                pin_files: dict[int, str] | None = None, fit_files: dict[int, str] | None = None) -> str:
+    """report.txt for the ZIP: plain text a field user can print. `pin_files`: {cut number: file name};
+    `fit_files`: {first cut number of the fit test: file name}. Bolt-only reports are as in 1.0.x."""
+    pin_files, fit_files = pin_files or {}, fit_files or {}
     lines = [f"Flange Cutter {version} report", f"Model: {model_name}", f"SHA-256: {sha256}", ""]
     for c, lay, joins in zip(result.cuts, result.lays, result.joins):
         r = cut_report(c, lay, joins)
+        if r["kind"] == "pin":
+            pin = r["pin"]
+            side = "the arrow side" if c.pocket_half == "A" else "the other side"
+            where = f"pushed in from {_parts_phrase(pin['push_from'])}" if pin["push_from"] else f"heads on {side}"
+            bevel = _parts_phrase(pin["push_from"]) if pin["push_from"] else side
+            lines += [f"Cut {r['cut']}: {_many(r['bolts'], 'printed snap pin')}, {pin['diameter']:g} mm, "
+                      f"{pin['length']:.1f} mm long, {where} (flange on the {c.side})",
+                      f"  joins: " + (", ".join(f"{j['parts'][0]}-{j['parts'][1]} ({_many(j['bolts'], 'pin')})"
+                                                for j in r["joins"]) or "nothing"),
+                      f"  flange {r['flange_thickness']} mm thick per part, {r['flange_width']} mm wide; "
+                      f"pin line {r['bolt_line']} mm from the wall; holes {r['hole_diameter']} mm, bevelled on {bevel}",
+                      f"  plane origin {np.round(c.plane.origin, 2).tolist()}, normal {np.round(c.plane.normal, 4).tolist()}"]
+            continue
         lines += [f"Cut {r['cut']}: {r['bolts']} x {r['bolt_spec']} bolts, {r['nuts']} nuts, {r['washers']} washers "
                   f"({r['fastening'].lower()}, flange on the {c.side})",
                   f"  joins: " + (", ".join(f"{j['parts'][0]}-{j['parts'][1]} ({j['bolts']} bolts)"
@@ -1468,14 +1781,47 @@ def report_text(result: Result, model_name: str, sha256: str, version: str, file
         if r["pocket"]:
             lines.append(f"  nut pockets on side {c.pocket_half}: {r['pocket']['across_flats']:.1f} mm across flats, "
                          f"{r['pocket']['depth']:.1f} mm deep")
+    kinds = {c.d.kind for c in result.cuts}
     lines += ["", "Parts (print each as it lies in its file: the cut face on the print sheet):"]
     for p in result.parts:
         r = part_report(p)
         down = f"cut {r['face_down']} face down" if r["face_down"] else "as loaded"
+        held = (f"{r['bolts']} bolts" if kinds == {"bolt"} else _many(r["pins"], "pin") if kinds == {"pin"}
+                else f"{_many(r['bolts'], 'bolt')}, {_many(r['pins'], 'pin')}")
         lines.append(f"  Part {p.name}: {files.get(p.name, '')}  {r['volume_cm3']} cm³, "
-                     f"{' x '.join(f'{v:g}' for v in r['size'])} mm, {down}, {r['bolts']} bolts")
+                     f"{' x '.join(f'{v:g}' for v in r['size'])} mm, {down}, {held}")
+    if result.pins:
+        lines += ["", "Pins:"]
+        for ft in result.fit_tests:
+            n = ft.cuts[0] + 1
+            lines.append(f"  Fit test for {_cuts_phrase([i + 1 for i in ft.cuts])}: {fit_files.get(n, '')}  "
+                         "print it first: two flange squares and one pin")
+        reports = _pin_reports(result)
+        for r in reports:
+            if r["same_as"]:
+                what = f"{r['count']} pins ({r['needed']} + {r['spares']} spares), the same pins as cut {r['same_as']}"
+            else:
+                what = (f"{r['count']} pins ({r['needed']} + {r['spares']} spares), {r['diameter']:g} mm, "
+                        f"{r['length']:.1f} mm long, for 2 x {r['flange_thickness']} mm of flange")
+            lines.append(f"  Cut {r['cut']}: {pin_files.get(r['cut'], '')}  {what}")
+        if len({p.spec.shape for p in result.pins}) > 1:
+            lines.append("  Keep each cut's pins apart: they differ in length.")
+        lines += ["  The fit test: put the two faces that lay on the print sheet together, the square with the bevel",
+                  "  round its hole on top. Push the pin in from there until it clicks.",
+                  "    Good: a firm thumb push, a click, and the squares stay together when you pull hard.",
+                  "    Does not go in, or a prong cracks: Extra pin hole size 0.2, then 0.3.",
+                  "    Goes in but does not click, or comes back out: Pin preload 0.1, then 0.",
+                  "    Clicks, but the squares can be pulled apart a little: Pin preload 0.3, then 0.4.",
+                  "    Clicks, but the squares wobble sideways: Extra pin hole size 0.0.",
+                  "    Set the new value on every cut with pins, generate again and make a new fit test.",
+                  "  Assembly: hold the parts together, lined up. Push each pin in from the part with the bevelled",
+                  "  holes (see each cut above) until it clicks.",
+                  "  To take a pin out: squeeze the two barbs together with pliers and push it back, or cut the head",
+                  "  off and push the rest out. Use a spare, or make new pins."]
     lines += ["", "Hardware (all cuts):"] + [f"  {h['qty']} x {h['item'].lower()} {h['spec']}"
                                               for h in hardware(result.cuts, result.lays)]
+    if result.pins and not hardware(result.cuts, result.lays):
+        lines.append("  nothing to buy")
     if result.warnings:
         lines += ["", "Warnings:"] + [f"  - {w['message']} {w['action']}" for w in result.warnings]
     return "\n".join(lines) + "\n"

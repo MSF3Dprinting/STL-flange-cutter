@@ -244,6 +244,96 @@ def test_cut_generate_download(page, tmp_path, shots):
     assert page.errors == []
 
 
+
+def test_pins(page, tmp_path, shots):
+    """The Pin button: pin words and fields, a hidden red field that must not block Generate, the pin files,
+    the fit test and the ZIP, back to bolts, Reset keeping Pin and the pin fit, saved settings."""
+    expect = sync_api.expect
+    page.set_input_files("#file-input", str(SAMPLE))
+    wait_preview(page, 0)
+    for field, value in (("pos-x", "6.6"), ("pos-y", "0"), ("pos-z", "120"),
+                         ("rot-x", "-90"), ("rot-y", "0"), ("rot-z", "180")):
+        page.fill(f"#{field}", value)
+    wait_preview(page, 0, normal=[0, 1, 0], bolts=8)
+    for width in (1366, 1280):                      # Pin on the same line as M3-M6 on a laptop
+        page.set_viewport_size({"width": width, "height": 657})
+        tops = page.evaluate("[...document.querySelectorAll('#fastener-field .segs label')]"
+                             ".map((l) => l.getBoundingClientRect().top)")
+        assert len(tops) == 5 and max(tops) - min(tops) <= 1, (width, tops)
+    page.set_viewport_size({"width": 1600, "height": 1000})
+
+    page.fill("#p-hole_diameter", "5")              # valid for M4
+    wait_preview(page, 0, normal=[0, 1, 0], bolts=8)
+    page.fill("#p-hole_diameter", "x")
+    expect(page.locator("#generate")).to_be_disabled()
+    page.click("#pin-choice label")
+    wait_preview(page, 0, normal=[0, 1, 0], bolts=8)
+    expect(page.locator("#generate")).to_be_enabled()          # the hidden red field was cleared
+    assert page.evaluate(f"{STATE}.preview.get({STATE}.cuts[0].id).derived.hole_diameter") == 8.1
+    expect(page.locator("#cut-list")).to_contain_text("Pin 8 mm · 8 pins · outside")
+    expect(page.locator("#step-bolts legend")).to_contain_text("Pins and flange")
+    expect(page.locator("#fastening-field")).to_be_hidden()
+    expect(page.locator("#pocket-label")).to_have_text("Pin heads on")
+    expect(page.locator("#p-pin_diameter")).to_be_visible()
+    expect(page.locator("#p-hole_diameter")).to_be_hidden()
+    expect(page.locator("#p-thickness")).to_have_attribute("placeholder", "auto 6")
+    expect(page.locator("#cutview .legend")).to_contain_text("Pin head")
+    expect(page.locator("#suggest")).to_have_attribute("title", "About one pin every 35 mm")
+    page.click("#advanced summary")
+    page.fill("#p-pin_hole_clearance", "0.2")
+    wait_preview(page, 0, normal=[0, 1, 0], bolts=8)
+    scroll_to(page, "step-bolts")
+    shot(page, shots / "09-pins.png")
+    page.click("#advanced summary")
+
+    page.click("#generate")
+    expect(page.locator("#parts-body tr")).to_have_count(2, timeout=60000)
+    expect(page.locator("#status-text")).to_have_text("Done: 2 parts and 10 pins. Print the fit test first (step 5).")
+    expect(page.locator("#joins")).to_contain_text("Cut 1: 8 pins of 8 mm")
+    expect(page.locator("#joins")).to_contain_text("pushed in from part B")
+    expect(page.locator("#hardware-none")).to_be_visible()
+    expect(page.locator("#pins-body tr").nth(0)).to_contain_text("fit test for cut 1")
+    expect(page.locator("#pins-body tr").nth(1)).to_contain_text("pins for cut 1")
+    expect(page.locator("#parts-fastener")).to_have_text("Pins")
+    expect(page.locator("#downloads a").first).to_have_text("Download fit test, cut 1")
+    scroll_to(page, "step-generate")
+    shot(page, shots / "10-pins-results.png")
+    data = download(page, "Download pins, cut 1", tmp_path).read_bytes()
+    assert len(data) == 84 + 50 * int.from_bytes(data[80:84], "little")                     # binary STL
+    tm = reload_stl(data)
+    assert tm.is_watertight and len(tm.split(only_watertight=False)) == 10
+    assert len(reload_stl(download(page, "Download fit test, cut 1", tmp_path).read_bytes())
+               .split(only_watertight=False)) == 3
+    with zipfile.ZipFile(download(page, "Download all (ZIP)", tmp_path)) as z:
+        assert sorted(z.namelist()) == ["demo_mold_fit_test_cut_1.stl", "demo_mold_part_A.stl",
+                                        "demo_mold_part_B.stl", "demo_mold_pins_cut_1.stl", "report.txt",
+                                        "settings.json"]
+        in_zip = json.loads(z.read("settings.json"))
+    with page.expect_download() as info:
+        page.click("#save-settings")
+    info.value.save_as(tmp_path / "saved.json")
+    saved = json.loads((tmp_path / "saved.json").read_text(encoding="utf-8"))
+    assert same(saved, in_zip), (saved, in_zip)
+    assert saved["cuts"][0]["bolt"] == "pin" and saved["cuts"][0]["params"]["pin_hole_clearance"] == 0.2
+
+    page.click("#back-to-edit")                    # back to bolts: the bolt fields come back as they were
+    page.click("#bolt-sizes label:has-text('M4')")
+    wait_preview(page, 0, normal=[0, 1, 0], bolts=8)
+    expect(page.locator("#cut-list")).to_contain_text("M4 · 8 bolts · outside")
+    expect(page.locator("#fastening-field")).to_be_visible()
+    expect(page.locator("#p-pin_diameter")).to_be_hidden()
+    expect(page.locator("#p-hole_diameter")).to_have_value("5")
+    page.click("#pin-choice label")
+    wait_preview(page, 0, normal=[0, 1, 0])
+    page.click("#reset-defaults")                  # keeps Pin and the pin fit (the fit test's result)
+    wait_preview(page, 0, normal=[0, 1, 0])
+    expect(page.locator("#cut-list")).to_contain_text("Pin 8 mm")
+    expect(page.locator("#p-pin_hole_clearance")).to_have_value("0.2")
+    page.set_input_files("#settings-input", str(tmp_path / "saved.json"))
+    wait_preview(page, 0, normal=[0, 1, 0], bolts=8)
+    expect(page.locator("#cut-list")).to_contain_text("Pin 8 mm")
+    assert page.errors == []
+
 def test_fragile_paths(page):
     """Paths that went wrong before: a click on the gizmo, Generate right after an edit, Suggest on a red
     field, a decimal comma, Add cut twice from the same cut, one cut with an error, Delete cut."""

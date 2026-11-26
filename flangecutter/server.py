@@ -124,12 +124,24 @@ def create_app(session: Session | None = None) -> Flask:
             s.work.release()
         stem = _stem(model.name)
         files = {p.name: f"{stem}_part_{p.name}.stl" for p in result.parts}
-        rid = s.add_result({"result": result, "model": model, "files": files, "settings": settings_json(model, cuts)})
+        pin_files = {p.cut + 1: f"{stem}_pins_cut_{p.cut + 1}.stl" for p in result.pins}
+        fit_files = {f.cuts[0] + 1: f"{stem}_fit_test_cut_{f.cuts[0] + 1}.stl" for f in result.fit_tests}
+        rid = s.add_result({"result": result, "model": model, "files": files, "pin_files": pin_files,
+                            "fit_files": fit_files, "settings": settings_json(model, cuts)})
         out = cutter.summary(result)
         for part in out["parts"]:
             part["file"] = files[part["name"]]
             part["url"] = f"/api/result/{rid}/{part['name']}.stl"
-        log.info("generated %d parts in %.2f s", len(result.parts), result.seconds)
+        for pins in out["pins"]:
+            pins |= {"file": pin_files[pins["cut"]], "url": f"/api/result/{rid}/pins/{pins['cut']}.stl"}
+        for fit in out["fit_tests"]:
+            n = fit["cuts"][0]
+            fit |= {"file": fit_files[n], "url": f"/api/result/{rid}/fit/{n}.stl"}
+        if result.pins:
+            log.info("generated %d parts and %d pins in %.2f s", len(result.parts),
+                     sum(p.count for p in result.pins), result.seconds)
+        else:
+            log.info("generated %d parts in %.2f s", len(result.parts), result.seconds)
         return jsonify(out | {"result_id": rid, "zip": f"/api/result/{rid}/bundle.zip"})
 
     @app.get("/api/progress")
@@ -145,12 +157,35 @@ def create_app(session: Session | None = None) -> Flask:
         return send_file(io.BytesIO(part.stl()), mimetype="model/stl", as_attachment=True,
                          download_name=entry["files"][name])
 
+    # pins and fit tests have their own path segment: a flat "pins_1.stl" would fall into the part route
+    @app.get("/api/result/<rid>/pins/<int:cut>.stl")
+    def pins_stl(rid: str, cut: int):
+        entry = s.result(rid)
+        plate = next((p for p in entry["result"].pins if p.cut + 1 == cut), None)
+        if plate is None:
+            raise CutError(f"There are no pins for cut {cut} in these results.")
+        return send_file(io.BytesIO(plate.stl()), mimetype="model/stl", as_attachment=True,
+                         download_name=entry["pin_files"][cut])
+
+    @app.get("/api/result/<rid>/fit/<int:cut>.stl")
+    def fit_stl(rid: str, cut: int):
+        entry = s.result(rid)
+        test = next((f for f in entry["result"].fit_tests if f.cuts[0] + 1 == cut), None)
+        if test is None:
+            raise CutError(f"There is no fit test for cut {cut} in these results.")
+        return send_file(io.BytesIO(test.stl()), mimetype="model/stl", as_attachment=True,
+                         download_name=entry["fit_files"][cut])
+
     @app.get("/api/result/<rid>/bundle.zip")
     def bundle(rid: str):
         entry = s.result(rid)
         result, model, files = entry["result"], entry["model"], entry["files"]
+        pin_files, fit_files = entry.get("pin_files", {}), entry.get("fit_files", {})
         content = {files[p.name]: p.stl() for p in result.parts}
-        content["report.txt"] = cutter.report_text(result, model.name, model.sha256, __version__, files)
+        content |= {pin_files[p.cut + 1]: p.stl() for p in result.pins}
+        content |= {fit_files[f.cuts[0] + 1]: f.stl() for f in result.fit_tests}
+        content["report.txt"] = cutter.report_text(result, model.name, model.sha256, __version__, files,
+                                                   pin_files, fit_files)
         content["settings.json"] = json.dumps(entry["settings"], indent=1, ensure_ascii=False)
         return send_file(io.BytesIO(mesh_io.zip_bytes(content)), mimetype="application/zip", as_attachment=True,
                          download_name=f"{_stem(model.name)}_parts.zip")

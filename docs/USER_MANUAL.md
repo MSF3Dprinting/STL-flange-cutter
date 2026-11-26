@@ -1,18 +1,20 @@
 # Flange Cutter user manual
 
-Version 1.0.2
+Version 1.1.0
 
 ## What Flange Cutter does
 
 Some molds are too big for your printer, or must open to take the cast out. Then the mold must be
-cut into parts. A mold wall is only 2 to 3 mm thick, so pins or dovetails do not fit in it.
+cut into parts. A mold wall is only 2 to 3 mm thick, so nothing can hold the parts inside the wall
+itself.
 
 Flange Cutter cuts the mold and adds a **flange** along every cut: a flat rim that grows from one
 face of the wall, normally the outside. Bolts go through the flanges of the two parts and hold them
-together. The other face of the wall, the mold surface, stays clean.
+together. If you have no bolts, Flange Cutter can make printed snap pins instead. The other face of
+the wall, the mold surface, stays clean.
 
 You can make one cut, or several cuts at any angle. You get one STL file per part, ready to print,
-and a list of the bolts, nuts and washers you need.
+and a list of the bolts, nuts and washers you need, or the pins to print.
 
 Flange Cutter works offline. Your files stay on your computer.
 
@@ -22,7 +24,7 @@ Flange Cutter comes as one ZIP file. Nothing is installed, and you do not need a
 
 **Unzip**
 
-1. Right-click `FlangeCutter-1.0.2-portable.zip` and choose **Extract All**. Pick a folder where
+1. Right-click `FlangeCutter-1.1.0-portable.zip` and choose **Extract All**. Pick a folder where
    you can save files, for example **Documents**.
 2. Open the new **FlangeCutter** folder and double-click **FlangeCutter.exe**.
 3. If Windows shows "Windows protected your PC", see the next section.
@@ -108,8 +110,8 @@ selected cut, so a slightly missed handle never switches cuts. The list always w
 Every cut has its own settings in steps 3 and 4. The step titles name the cut they change.
 
 The list shows each cut's state: **OK**, **Warning** or **Error**. Read the message under the list.
-Cuts may cross. Where two cuts cross, the app keeps bolts away from the crossing, so the bolts of
-the two cuts never meet.
+Cuts may cross. Where two cuts cross, the app keeps bolts or pins away from the crossing, so the
+bolts or pins of the two cuts never meet.
 
 ![Two cuts: lengthwise and across](screenshots/07-two-cuts.png)
 
@@ -132,9 +134,9 @@ which has no edge), step 1 shows the warning "Flange Cutter could not find the e
 and the flange side is chosen piece by piece along each cut. Check the flange in the preview, especially near the edge of the mold: it should stay on
 the face you chose.
 
-### Step 4: Bolts and flange
+### Step 4: Bolts or pins, and flange
 
-- **Bolt size**: M3, M4, M5 or M6.
+- **Bolt size or pin**: M3, M4, M5 or M6, or **Pin** for printed snap pins (see below).
 - **Bolts**: choose **Number of bolts** (click **Suggest** for about one bolt every 50 mm), or
   **Spacing**, the distance between bolts in mm.
 - **Fastening**:
@@ -153,6 +155,29 @@ with a wrong value turns red.
 
 ![Step 4: bolts and flange, with Advanced open](screenshots/04-bolts.png)
 
+**Pin** makes printed snap pins instead of bolts: you need no bolts, nuts or washers. Each pin goes
+through both flanges. Its head rests on one flange, and its two barbs click in behind the other.
+With **Pin**, step 4 changes:
+
+- **Pin diameter**: 8 to 12 mm. 8 mm is normal. The pin head is 1.5 times as wide.
+- **Pin heads on**: **Arrow side** or **Other side** (normally Other side). This is the side you push
+  the pins in from. Only its holes get a small bevel. Choose the side your thumb can reach; the other
+  side needs room for pliers, to take a pin out.
+- **Number of pins**, **Spacing** and **Suggest** (about one pin every 35 mm) work as for bolts.
+- The flange is **6 mm** thick by default (7 or 8 mm for pins over 10 mm). The pins are made for that
+  thickness. A thinner or thicker flange gives a warning, because the pins then hold less or may
+  crack.
+- **Hole diameter** and **Fastening** are hidden: the pin sets the holes.
+- **Advanced** also has **Extra pin hole size** (0.1 mm: added to the pin diameter for the holes;
+  less is tighter, more is looser) and **Pin preload** (0.2 mm: how hard each pin pulls the flanges
+  together). Change them only after a fit test (see "Pins: fit test and assembly").
+- **Reset to defaults** keeps Pin and these two values. **Use these settings for all cuts** also
+  copies Pin.
+
+Every cut chooses bolts or pins on its own.
+
+![Step 4 with Pin chosen](screenshots/09-pins.png)
+
 ### Step 5: Generate and export
 
 Click **Generate**. A bar shows the progress. Large models take longer.
@@ -163,11 +188,15 @@ them apart. **Back to editing** shows the cuts again.
 The panel shows:
 
 - **Warnings**: what to check, and what to do.
-- **Parts**: size, the face that goes on the print sheet, and the number of bolts.
-- **Hardware**: all bolts (with their length), nuts and washers to buy. Under it, each cut lists
-  its hardware and which parts it joins.
+- **Parts**: size, the face that goes on the print sheet, and the number of bolts or pins.
+- **Pins to print** (only with pins): the fit test of each pin size first, then each cut's pin file
+  with the pins it needs plus 2 spares.
+- **Hardware**: all bolts (with their length), nuts and washers to buy. With pins only, it says
+  **Nothing to buy**. Under it, each cut lists its bolts or pins and which parts it joins.
 - **Download part A**, **Download part B**… one STL file each, and **Download all (ZIP)**: all
-  parts, a `report.txt` with all the details and a `settings.json`.
+  parts, a `report.txt` with all the details and a `settings.json`. With pins there are also
+  **Download fit test, cut 1** and **Download pins, cut 1** (for example
+  `demo_mold_fit_test_cut_1.stl` and `demo_mold_pins_cut_1.stl`); the ZIP holds them too.
 
 The files go to your browser's **Downloads** folder. The file names carry the part letter, for
 example `demo_mold_part_A.stl`.
@@ -179,6 +208,8 @@ If you change anything after Generate, click Generate again to make new parts.
 
 ![Step 5: the parts, hardware list and downloads](screenshots/05-generate.png)
 
+![Step 5 with pins: the fit test and the pins to print](screenshots/10-pins-results.png)
+
 ## Reading the 2D cut view
 
 Under the panel, the 2D cut view shows the selected cut, seen from the arrow side.
@@ -189,11 +220,11 @@ Under the panel, the 2D cut view shows the selected cut, seen from the arrow sid
 |---|---|
 | Dark gray band | The mold wall, where the cut goes through it. |
 | Amber area | The flange. |
-| White circles | Bolt holes. |
-| Dashed circles | The washers. They must lie on the flange. |
-| Line through the holes | The bolt line. A dashed part has no room for bolts (another cut is too close). |
-| Red bolt | A tool cannot reach this bolt: the wall is in the way. |
-| Colored dashed line, "Cut 1 crosses here" | Another cut crosses this one. No bolts near it. |
+| White circles | Bolt or pin holes. |
+| Dashed circles | The washers, or the pin heads. They must lie on the flange. |
+| Line through the holes | The bolt or pin line. A dashed part has no room for bolts or pins (another cut is too close). |
+| Red bolt or pin | A tool, or your thumb, cannot reach it: the wall is in the way. |
+| Colored dashed line, "Cut 1 crosses here" | Another cut crosses this one. No bolts or pins near it. |
 | "mold cavity" | The inside of the mold. With **Outside**, the flange never grows into it. With **Inside**, the flange grows from the inner face into the cavity. |
 
 ## Warnings and errors
@@ -225,6 +256,16 @@ Each warning says what to do. The most common ones:
 | A loose piece of flange was left out | One cut cut off a piece of another cut's flange. | Move the cuts so they cross inside the wall. |
 | Part X: the flange of cut N hangs in the air | That flange has nothing under it when printed. | Turn on supports for this part in PrusaSlicer. |
 | Part X may need a repair in your slicer | Rare problem in the exported file. | Let PrusaSlicer repair it, or move the cut 0.1 mm and generate again. |
+| The flange is too thin for … mm pins | The prongs would bend too far when you press the pins in. | Make the flange thicker, or leave Flange thickness empty. |
+| In this flange the pins hold only about … N each | The flange is far from the thickness the pins are made for. | Leave Flange thickness empty, or use a larger pin diameter if the message says so. |
+| The pin head does not sit on full-thickness flange | Near the mold's edge the flange is thinner, so those pins would be loose. | Make the flange wider, or move the cut away from the edge. |
+| The wall leaves no room to push pin … in | A pin goes in only straight along its axis, from the head side, and needs about 25 mm of free space there. These pins are red in the 2D view. | Choose the other side under Pin heads on if the message says so, move or turn the cut, or use bolts on this cut. |
+| The wall is in the way at pin … | There may be no room for pliers to take that pin out. | Move or turn the cut, or check that pliers can reach it. |
+| The pin holes print sideways in parts … | Those parts lie on another cut's face, so their pin holes come out a little tight. | Try one pin in the first of these parts. If it is too tight, open the hole a little, or raise Extra pin hole size. |
+| The pins of cut N take … mm on the print sheet | The pin file is large. | Print the pins in batches if it does not fit. |
+| The pin file / fit test … may need a repair | Rare problem in the exported file. | Let your slicer repair it, or change the flange thickness by 0.1 mm and generate again. |
+
+With pins, the bolt messages say pin, for example "Some pins are only … mm apart" or "Too many pins".
 
 ## Printing the parts
 
@@ -237,7 +278,39 @@ Each warning says what to do. The most common ones:
   the print sheet.
 - Write the part letter on each part with a marker when it comes off the printer.
 
-## Assembly
+## Pins: fit test and assembly
+
+With pins, each cut has a **pin file** with the pins it needs plus 2 spares, and each pin size has a
+**fit test**: two small flange squares with one hole, and one pin. Make the fit test first, and again
+after you change the pin diameter, the flange thickness or a pin setting.
+
+**The fit test.** Put the two faces that lay on the print sheet together, with the square that has the
+bevel round its hole on top. Push the pin in from there until it clicks.
+
+| What happens | What to change (in Advanced, on every cut with pins) |
+|---|---|
+| A firm thumb push, a click, and the squares stay together when you pull hard | Nothing. |
+| The pin does not go in, or a prong cracks | Extra pin hole size 0.2, then 0.3. |
+| It goes in but does not click, or comes back out | Pin preload 0.1, then 0. |
+| It clicks, but the squares can be pulled apart a little | Pin preload 0.3, then 0.4. |
+| It clicks, but the squares wobble sideways | Extra pin hole size 0.0. |
+
+Then generate again and make a new fit test. Write down the best values for each printer.
+
+**Assembly with pins.**
+
+1. Hold the parts together, lined up as in the 3D view. Pins have no finger-tight stage.
+2. Push each pin through both flanges from the part with the bevelled holes until it clicks. The
+   cut list under Hardware and `report.txt` name that part. Where cuts cross, put in the pins next to
+   the crossing first.
+3. A pin does not click: check that you push it in from the bevelled side, and that the cut faces
+   touch everywhere.
+4. A pin does not go in: open that hole a little with a drill bit of the pin size, turned by hand, or
+   with a round file. Never hammer.
+5. To take a pin out, squeeze its two barbs together with pliers and push it back. Or cut the head off
+   and push the rest out from the head side. Use a spare, or make new pins.
+
+## Assembly with bolts
 
 1. Get the hardware from the **Hardware** list or `report.txt`. Each cut may need a different bolt
    length.

@@ -218,3 +218,7 @@ details[open] summary { margin-bottom: 4px; }
 #quit { background: #39424e; color: #fff; border-color: #5b6573; }
 #quit:hover { background: #4a5463; }
 .bye { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; font-size: 22px; background: var(--bg); }
+
+/* the bolt-size row with the Pin button: label above, so M3-M6 and Pin fit on one line (decision 68) */
+.choice.stacked { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.segs { display: flex; flex-wrap: wrap; gap: 8px; }

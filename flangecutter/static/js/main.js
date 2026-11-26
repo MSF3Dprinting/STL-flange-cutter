@@ -53,16 +53,21 @@ function cleanSettings(raw, replaced = []) {
     return ok;
   };
   const d = raw.distribution || {}, o = out.distribution;
+  // reads the catalog itself: start() cleans the prefs before the panel knows the catalog
+  const sizes = [...c.bolts.map((b) => b.name), c.pin.key], pin = raw.bolt === c.pin.key;
   if (keep(raw.side, ['outside', 'inside'].includes(raw.side), 'flange side')) out.side = raw.side;
-  if (keep(raw.bolt, c.bolts.some((b) => b.name === raw.bolt), 'bolt size')) out.bolt = raw.bolt;
+  if (keep(raw.bolt, sizes.includes(raw.bolt), 'bolt size')) out.bolt = raw.bolt;
   if (keep(raw.fastening, c.fastenings.some((f) => f.key === raw.fastening), 'fastening')) out.fastening = raw.fastening;
-  if (keep(raw.nut_pocket_half, ['A', 'B'].includes(raw.nut_pocket_half), 'nut pocket side')) out.nut_pocket_half = raw.nut_pocket_half;
-  if (keep(d.mode, ['count', 'spacing'].includes(d.mode), 'bolt layout')) o.mode = d.mode;
-  if (keep(d.count, Number.isInteger(d.count) && within(d.count, c.count.min, c.count.max), 'number of bolts')) o.count = d.count;
-  if (keep(d.spacing, within(d.spacing, c.spacing.min, c.spacing.max), 'bolt spacing')) o.spacing = d.spacing;
+  if (keep(raw.nut_pocket_half, ['A', 'B'].includes(raw.nut_pocket_half), pin ? 'pin head side' : 'nut pocket side')) {
+    out.nut_pocket_half = raw.nut_pocket_half;
+  }
+  if (keep(d.mode, ['count', 'spacing'].includes(d.mode), pin ? 'pin layout' : 'bolt layout')) o.mode = d.mode;
+  if (keep(d.count, Number.isInteger(d.count) && within(d.count, c.count.min, c.count.max),
+    pin ? 'number of pins' : 'number of bolts')) o.count = d.count;
+  if (keep(d.spacing, within(d.spacing, c.spacing.min, c.spacing.max), pin ? 'pin spacing' : 'bolt spacing')) o.spacing = d.spacing;
   for (const p of c.params) {                  // empty (null) = the automatic or standard value
-    const v = raw.params?.[p.key];
-    if (keep(v, v === null || within(v, p.min, p.max), p.label.toLowerCase()) && v !== null) out.params[p.key] = v;
+    const v = raw.params?.[p.key], name = (pin && p.pin_label ? p.pin_label : p.label).toLowerCase();
+    if (keep(v, v === null || within(v, p.min, p.max), name) && v !== null) out.params[p.key] = v;
   }
   return out;
 }
@@ -145,10 +150,13 @@ function syncViewer() {
 
 // ------------------------------------------------------------ showing the state
 function rowOf(cut, i) {
-  const p = state.preview.get(cut.id), d = cut.distribution;
-  const bolts = p && !p.error ? `${p.count} bolts` : d.mode === 'count' ? `${d.count} bolts` : `every ${d.spacing} mm`;
+  const p = state.preview.get(cut.id), d = cut.distribution, fastener = panel.kindOf(cut.bolt);
+  const n = p && !p.error ? p.count : d.mode === 'count' ? d.count : null;
+  const count = n != null ? panel.many(n, fastener) : `every ${d.spacing} mm`;
+  const diameter = cut.params.pin_diameter ?? state.catalog.params.find((q) => q.key === 'pin_diameter').default;
+  const name = fastener === 'pin' ? `Pin ${panel.fmt(diameter)} mm` : cut.bolt;
   const [kind, text] = !p ? ['', '...'] : p.error ? ['error', 'Error'] : p.warnings.length ? ['warn', 'Warning'] : ['ok', 'OK'];
-  return { number: i + 1, color: CUT_COLORS[i], summary: `${cut.bolt} · ${bolts} · ${cut.side}`, status: kind,
+  return { number: i + 1, color: CUT_COLORS[i], summary: `${name} · ${count} · ${cut.side}`, status: kind,
     statusText: text, stale: cut.shown !== cut.version, title: p?.error || p?.warnings?.map((w) => w.message).join('\n') || null };
 }
 
@@ -168,6 +176,10 @@ function drawCut() {
   const marks = drawCutView($('cutview-svg'), p && !p.error ? p : null, CUT_COLORS);
   $('key-noroom').hidden = !marks.noRoom;       // the legend explains only what is drawn
   $('key-blocked').hidden = !marks.blocked;
+  const kind = p && !p.error ? p.derived.kind : cut ? panel.kindOf(cut.bolt) : 'bolt';    // of what is drawn
+  for (const e of document.querySelectorAll('#cutview [data-pin]')) e.textContent = e.dataset[kind];
+  $('key-blocked').title = kind === 'pin' ? 'The wall is in the way of pushing in or taking out this pin'
+    : 'The wall is in the way of a tool for this bolt';
 }
 
 /** Update everything that shows the cuts: list, forms, warnings, results, 2D view, buttons. */
@@ -355,14 +367,18 @@ const actions = {
     if (n) actions.change({ distribution: { mode: 'count', count: n } });
   },
   resetDefaults() {
-    const cut = selCut();
-    Object.assign(cut, factorySettings());
+    const cut = selCut(), fresh = factorySettings();
+    if (panel.kindOf(cut.bolt) === 'pin') fresh.bolt = state.catalog.pin.key;   // a site without bolts never gets M4 back
+    // the pin fit belongs to the printer (the fit test found it): a reset never undoes it
+    for (const key of ['pin_hole_clearance', 'pin_preload']) fresh.params[key] = cut.params[key];
+    Object.assign(cut, fresh);
     edited(cut, true);
     refresh();
   },
   applyAll() {
     const src = selCut(), others = state.cuts.length - 1;
-    if (!others || !window.confirm(`Copy the flange side, bolts and flange of cut ${state.sel + 1} to the other `
+    const what = panel.kindOf(src.bolt) === 'pin' ? 'pins' : 'bolts';
+    if (!others || !window.confirm(`Copy the flange side, ${what} and flange of cut ${state.sel + 1} to the other `
       + `${others === 1 ? 'cut' : `${others} cuts`}? Their own settings are replaced.`)) return;
     for (const c of state.cuts) {
       if (c === src) continue;
@@ -403,7 +419,9 @@ async function generate() {
     viewer.setParts(result.parts, buffers);
     viewer.showParts(true);
     $('explode').value = 0;
-    status(`Done: ${result.parts.length} parts. Download them in step 5.`);
+    const pins = result.pins.reduce((sum, p) => sum + p.count, 0);
+    status(pins ? `Done: ${panel.many(result.parts.length, 'part')} and ${panel.many(pins, 'pin')}. Print the fit test `
+      + 'first (step 5).' : `Done: ${result.parts.length} parts. Download them in step 5.`);
   } catch (e) {
     status(e.message, 'error');
   } finally {
